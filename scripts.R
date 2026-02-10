@@ -255,6 +255,8 @@ library(Matrix)
 
 q_levels <- c(0.05, 0.5, 0.95)
 
+q_grid <- seq(0.05, 0.95, by = 0.05)   # 19个分位数
+
 # drf_pred <- predict(drf_fit, Xte_tree)  # 你已经有了
 W <- drf_pred$weights      # n_test x n_train, dgCMatrix
 y_train <- as.numeric(drf_pred$y)  # 训练集 y（LOS）
@@ -277,6 +279,16 @@ drf_q_mat <- t(sapply(1:nrow(W), function(i) {
 
 drf_q <- as.data.frame(drf_q_mat)
 colnames(drf_q) <- c("q05","q50","q95")
+
+# ---- DRF quantile grid predictions (NEW) ----
+drf_qgrid_mat <- t(sapply(1:nrow(W), function(i) {
+  w <- as.numeric(W[i, ])
+  wquant(y_train, w, q_grid)
+}))
+
+drf_qgrid <- as.data.frame(drf_qgrid_mat)
+colnames(drf_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
+# 例如 q05 q10 ... q95
 # 3-fit QRF
 
 library(quantregForest)
@@ -292,6 +304,10 @@ qrf_q <- as.data.frame(
   predict(qrf_fit, Xte_all, what = q_levels)
 )
 colnames(qrf_q) <- c("q05","q50","q95")
+
+# ---- QRF quantile grid predictions (NEW) ----
+qrf_qgrid <- as.data.frame(predict(qrf_fit, Xte_all, what = q_grid))
+colnames(qrf_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
 
 
 # 4-fit ranger
@@ -311,6 +327,12 @@ rf_q <- as.data.frame(
   predict(rf_q_fit, Xte_all, type = "quantiles", quantiles = q_levels)$predictions
 )
 colnames(rf_q) <- c("q05","q50","q95")
+
+# ---- Ranger quantile grid predictions (NEW) ----
+rf_qgrid <- as.data.frame(
+  predict(rf_q_fit, Xte_all, type = "quantiles", quantiles = q_grid)$predictions
+)
+colnames(rf_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
 
 
 # 5-XGBoost + Conformal prediction
@@ -365,6 +387,16 @@ xgb_q <- data.frame(
   q50 = pred_test,
   q95 = pred_test + q_hat
 )
+
+# ---- XGB conformal quantile grid predictions (NEW) ----
+scale_tau <- (q_grid - 0.5) / 0.5   # 0.05->-0.9, 0.95->+0.9 (注意不是±1)
+# 这会让 q05/q95 不再等于你原来 pred±q_hat（原来相当于tau=0.0/1.0的极端）
+# 为了“保持一致”，我们用一种更贴近你原设置的方式：把 0.05/0.95 映射到 ±1
+scale_tau2 <- (q_grid - 0.5) / 0.45  # 0.05->-1, 0.95->+1
+
+xgb_qgrid_mat <- sapply(scale_tau2, function(s) pred_test + s * q_hat)
+xgb_qgrid <- as.data.frame(xgb_qgrid_mat)
+colnames(xgb_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
 
 # evaluation
 
@@ -564,3 +596,89 @@ out_vaso_wis <- eval_df %>%
   pivot_longer(-vaso_group, names_to = "model", values_to = "WIS")
 
 out_vaso_wis
+
+# ----- conditional calibration ----------#
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# --- 1) 重新计算汇总数据，增加二项分布标准误 ---
+cal_df_clean <- cal_df %>%
+  mutate(
+    # 计算二项分布的标准误，用于绘制误差带
+    se = sqrt(coverage * (1 - coverage) / n_bin),
+    lower = pmax(0, coverage - 1.96 * se),
+    upper = pmin(1, coverage + 1.96 * se)
+  )
+
+# --- 2) 绘制精美的可视化图表 ---
+ggplot(cal_df_clean, aes(x = x, y = coverage)) +
+  # 90% 目标线（稍微加粗并改为红色虚线，更显眼）
+  geom_hline(yintercept = 0.90, linetype = "dashed", color = "red", alpha = 0.6) +
+  # 增加覆盖率的可信区间带（让图表看起来更专业）
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "steelblue", alpha = 0.15) +
+  # 绘制折线和统一大小的点
+  geom_line(color = "steelblue", size = 0.8) +
+  geom_point(color = "steelblue", size = 1.5, alpha = 0.8) +
+  # 分面
+  facet_wrap(~ model, ncol = 2) +
+  # 坐标轴与标签美化
+  scale_y_continuous(labels = scales::percent, limits = c(0.6, 1.0)) +
+  labs(
+    title = "Conditional Calibration of 90% Prediction Intervals",
+    subtitle = "Assessing coverage stability across different LOS risk levels",
+    x = "Predicted Median LOS (Days)",
+    y = "Empirical Coverage (%)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    strip.background = element_rect(fill = "#f0f0f0"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+
+# ---- CRPS evaluation --------#
+
+# pinball loss
+pinball <- function(y, q, tau) {
+  u <- y - q
+  ifelse(u >= 0, tau * u, (tau - 1) * u)
+}
+
+# CRPS 近似：2 * \int pinball d tau （用梯形法）
+crps_from_quantiles <- function(y, qmat, taus) {
+  ord <- order(taus)
+  taus <- taus[ord]
+  qmat <- qmat[, ord, drop = FALSE]
+  
+  # 梯形权重
+  w <- numeric(length(taus))
+  w[1] <- (taus[2] - taus[1]) / 2
+  w[length(taus)] <- (taus[length(taus)] - taus[length(taus)-1]) / 2
+  if (length(taus) > 2) {
+    for (j in 2:(length(taus)-1)) {
+      w[j] <- (taus[j+1] - taus[j-1]) / 2
+    }
+  }
+  
+  # 对每个tau算 pinball，然后按权重积分
+  pb <- 0
+  for (j in seq_along(taus)) {
+    pb <- pb + w[j] * pinball(y, qmat[, j], taus[j])
+  }
+  mean(2 * pb, na.rm = TRUE)
+}
+
+
+# ---- CRPS with dense grid (NEW) ----
+crps_all_grid <- c(
+  DRF = crps_from_quantiles(eval_df$y, as.matrix(drf_qgrid), q_grid),
+  QRF = crps_from_quantiles(eval_df$y, as.matrix(qrf_qgrid), q_grid),
+  RF  = crps_from_quantiles(eval_df$y, as.matrix(rf_qgrid),  q_grid),
+  XGB = crps_from_quantiles(eval_df$y, as.matrix(xgb_qgrid), q_grid)
+)
+
+crps_all_grid
+
+
