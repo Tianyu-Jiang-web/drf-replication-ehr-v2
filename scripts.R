@@ -597,6 +597,88 @@ out_vaso_wis <- eval_df %>%
 
 out_vaso_wis
 
+# -------- multi-subgroup test ---------#
+
+eval_highmiss <- eval_df %>%
+  filter(miss_group == "High missing")
+
+eval_highmiss <- eval_highmiss %>%
+  mutate(
+    vent_flag = vent_group == "Ventilated",
+    vaso_flag = vaso_group == "Vasopressors"
+  )
+
+eval_highmiss <- eval_highmiss %>%
+  mutate(
+    subgroup_2 = case_when(
+      vent_flag & vaso_flag ~ "Vent + Vaso",
+      vent_flag & !vaso_flag ~ "Vent only",
+      !vent_flag & vaso_flag ~ "Vaso only",
+      TRUE ~ "Neither"
+    )
+  )
+
+eval_highmiss <- eval_highmiss %>%
+  mutate(
+    subgroup_critical = ifelse(
+      vent_flag & vaso_flag,
+      "High missing + Vent + Vaso",
+      "Other high missing"
+    )
+  )
+
+out_highmiss_critical_wis <- eval_highmiss %>%
+  group_by(subgroup_critical) %>%
+  summarise(
+    n_group = n(),
+    
+    DRF = wis_one(y, drf_q05, drf_q50, drf_q95),
+    QRF = wis_one(y, qrf_q05, qrf_q50, qrf_q95),
+    RF  = wis_one(y, rf_q05,  rf_q50,  rf_q95),
+    XGB = wis_one(y, xgb_q05, xgb_q50, xgb_q95),
+    
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(DRF, QRF, RF, XGB),
+    names_to = "model",
+    values_to = "WIS"
+  )
+
+out_highmiss_critical_wis
+
+eval_highmiss2 <- eval_df %>%
+  filter(miss_group == "High missing") %>%
+  mutate(
+    critical_or = case_when(
+      vent_group == "Ventilated" | vaso_group == "Vasopressors" ~
+        "High missing + Vent OR Vaso",
+      TRUE ~
+        "High missing only"
+    )
+  )
+
+out_highmiss_or_wis <- eval_highmiss2 %>%
+  group_by(critical_or) %>%
+  summarise(
+    n_group = n(),
+    
+    DRF = wis_one(y, drf_q05, drf_q50, drf_q95),
+    QRF = wis_one(y, qrf_q05, qrf_q50, qrf_q95),
+    RF  = wis_one(y, rf_q05,  rf_q50,  rf_q95),
+    XGB = wis_one(y, xgb_q05, xgb_q50, xgb_q95),
+    
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(DRF, QRF, RF, XGB),
+    names_to = "model",
+    values_to = "WIS"
+  )
+
+out_highmiss_or_wis
+
+
 # ----- conditional calibration ----------#
 library(dplyr)
 library(tidyr)
@@ -680,5 +762,231 @@ crps_all_grid <- c(
 )
 
 crps_all_grid
+
+
+
+# ----------
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+
+alpha_target <- 0.90   # 你的区间是 90% (0.05~0.95)
+
+# ---- 1) 组织成长表：每行=一个 test 样本 + 一个模型 ----
+cover_width_long <- eval_df %>%
+  transmute(
+    y,
+    # DRF
+    drf_q05, drf_q95,
+    # QRF
+    qrf_q05, qrf_q95,
+    # RF
+    rf_q05,  rf_q95,
+    # XGB
+    xgb_q05, xgb_q95
+  ) %>%
+  mutate(
+    drf_w = drf_q95 - drf_q05,
+    qrf_w = qrf_q95 - qrf_q05,
+    rf_w  = rf_q95  - rf_q05,
+    xgb_w = xgb_q95 - xgb_q05,
+    
+    drf_cov = as.integer(y >= drf_q05 & y <= drf_q95),
+    qrf_cov = as.integer(y >= qrf_q05 & y <= qrf_q95),
+    rf_cov  = as.integer(y >= rf_q05  & y <= rf_q95),
+    xgb_cov = as.integer(y >= xgb_q05 & y <= xgb_q95)
+  ) %>%
+  select(
+    y,
+    drf_w, drf_cov,
+    qrf_w, qrf_cov,
+    rf_w,  rf_cov,
+    xgb_w, xgb_cov
+  ) %>%
+  pivot_longer(
+    cols = -y,
+    names_to = c("model", ".value"),
+    names_pattern = "^(drf|qrf|rf|xgb)_(w|cov)$"
+  ) %>%
+  mutate(
+    model = recode(model,
+                   drf = "DRF", qrf = "QRF", rf = "RF", xgb = "XGB")
+  ) %>%
+  filter(is.finite(w), w >= 0)   # 去掉异常宽度
+
+# 看一下是否合理
+summary(cover_width_long$w)
+table(cover_width_long$model)
+
+
+n_bins <- 10
+
+cal_w_df <- cover_width_long %>%
+  group_by(model) %>%
+  mutate(
+    w_bin = ntile(w, n_bins)   # 每个模型各自按 width 分位数分箱（更公平）
+  ) %>%
+  group_by(model, w_bin) %>%
+  summarise(
+    n_bin = n(),
+    x = median(w, na.rm = TRUE),              # 你也可以改成 mean(w)
+    coverage = mean(cov, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # 二项分布近似标准误 (Wald CI)
+    se = sqrt(coverage * (1 - coverage) / n_bin),
+    lower = pmax(0, coverage - 1.96 * se),
+    upper = pmin(1, coverage + 1.96 * se)
+  )
+
+p_cov_vs_width <- ggplot(cal_w_df, aes(x = x, y = coverage)) +
+  geom_hline(yintercept = alpha_target, linetype = "dashed",
+             linewidth = 0.8, alpha = 0.7) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2, alpha = 0.85) +
+  facet_wrap(~ model, ncol = 2, scales = "free_x") +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(
+    title = "Coverage vs Predicted Interval Width (90% PI)",
+    subtitle = "Do wider (more uncertain) predictions achieve more reliable empirical coverage?",
+    x = "Predicted interval width  (w = q95 - q05)  [bin median]",
+    y = "Empirical coverage within bin"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    strip.background = element_rect(fill = "#f2f2f2"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+p_cov_vs_width
+
+
+# --------- conditional calibration heatmap --------#
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+
+alpha_target <- 0.90
+
+# ---- 0) 组织成长表：每行=一个样本+一个模型，包含 q50, width, covered ----
+long2d <- eval_df %>%
+  transmute(
+    y,
+    
+    drf_q05, drf_q50, drf_q95,
+    qrf_q05, qrf_q50, qrf_q95,
+    rf_q05,  rf_q50,  rf_q95,
+    xgb_q05, xgb_q50, xgb_q95
+  ) %>%
+  mutate(
+    drf_w = drf_q95 - drf_q05,
+    qrf_w = qrf_q95 - qrf_q05,
+    rf_w  = rf_q95  - rf_q05,
+    xgb_w = xgb_q95 - xgb_q05,
+    
+    drf_cov = as.integer(y >= drf_q05 & y <= drf_q95),
+    qrf_cov = as.integer(y >= qrf_q05 & y <= qrf_q95),
+    rf_cov  = as.integer(y >= rf_q05  & y <= rf_q95),
+    xgb_cov = as.integer(y >= xgb_q05 & y <= xgb_q95)
+  ) %>%
+  select(
+    y,
+    drf_q50, drf_w, drf_cov,
+    qrf_q50, qrf_w, qrf_cov,
+    rf_q50,  rf_w,  rf_cov,
+    xgb_q50, xgb_w, xgb_cov
+  ) %>%
+  pivot_longer(
+    cols = -y,
+    names_to = c("model", ".value"),
+    names_pattern = "^(drf|qrf|rf|xgb)_(q50|w|cov)$"
+  ) %>%
+  mutate(
+    model = recode(model, drf="DRF", qrf="QRF", rf="RF", xgb="XGB")
+  ) %>%
+  filter(is.finite(q50), is.finite(w), w >= 0)
+
+
+n_risk_bins <- 10
+n_w_bins    <- 10
+
+heat2d_df <- long2d %>%
+  group_by(model) %>%
+  mutate(
+    risk_bin  = ntile(q50, n_risk_bins),
+    width_bin = ntile(w,   n_w_bins)
+  ) %>%
+  group_by(model, risk_bin, width_bin) %>%
+  summarise(
+    n_cell   = n(),
+    q50_med  = median(q50, na.rm = TRUE),   # 用于标注/排序也行
+    w_med    = median(w,   na.rm = TRUE),
+    coverage = mean(cov,   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    delta = coverage - alpha_target,               # >0 over, <0 under
+    # coverage 的不确定性（可选，用于筛掉n太小的格子）
+    se = sqrt(coverage * (1 - coverage) / n_cell),
+    lower = pmax(0, coverage - 1.96 * se),
+    upper = pmin(1, coverage + 1.96 * se)
+  )
+
+min_n_cell <- 50   # 你可以调 30/50/100
+
+# 固化 delta_plot，保证所有 layer 都能用到
+heat2d_plot <- heat2d_df %>%
+  mutate(
+    delta_plot = ifelse(n_cell < min_n_cell, NA_real_, delta)
+  )
+
+p_heat_delta <- ggplot(
+  heat2d_df %>% mutate(delta_plot = ifelse(n_cell < min_n_cell, NA, delta)),
+  aes(x = risk_bin, y = width_bin, fill = delta_plot)
+) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  facet_wrap(~ model, ncol = 2) +
+  scale_x_continuous(breaks = 1:n_risk_bins) +
+  scale_y_continuous(breaks = 1:n_w_bins) +
+  scale_fill_gradient2(
+    low = "#d73027", mid = "white", high = "#1a9850",
+    midpoint = 0,
+    labels = percent_format(accuracy = 1),
+    na.value = "grey90",
+    name = "Coverage - 90%"
+  ) +
+  labs(
+    title = "2D Conditional Calibration (Risk × Uncertainty)",
+    subtitle = "Heatmap of deviation from 90% coverage. Grey cells: too few samples.",
+    x = "Risk bin (by predicted median q50)",
+    y = "Uncertainty bin (by interval width w = q95 - q05)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = "#f2f2f2"),
+    plot.title = element_text(face = "bold")
+  )
+
+p_heat_delta
+
+p_heat_delta_n <- p_heat_delta +
+  geom_text(
+    data = heat2d_plot %>% filter(!is.na(delta_plot)),
+    aes(label = n_cell),
+    size = 2.6,
+    color = "grey20"
+  )
+
+
+p_heat_delta_n
+
 
 
