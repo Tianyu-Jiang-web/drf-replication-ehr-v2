@@ -599,85 +599,156 @@ out_vaso_wis
 
 # -------- multi-subgroup test ---------#
 
-eval_highmiss <- eval_df %>%
-  filter(miss_group == "High missing")
+library(dplyr)
 
-eval_highmiss <- eval_highmiss %>%
-  mutate(
-    vent_flag = vent_group == "Ventilated",
-    vaso_flag = vaso_group == "Vasopressors"
-  )
-
-eval_highmiss <- eval_highmiss %>%
-  mutate(
-    subgroup_2 = case_when(
-      vent_flag & vaso_flag ~ "Vent + Vaso",
-      vent_flag & !vaso_flag ~ "Vent only",
-      !vent_flag & vaso_flag ~ "Vaso only",
-      TRUE ~ "Neither"
-    )
-  )
-
-eval_highmiss <- eval_highmiss %>%
-  mutate(
-    subgroup_critical = ifelse(
-      vent_flag & vaso_flag,
-      "High missing + Vent + Vaso",
-      "Other high missing"
-    )
-  )
-
-out_highmiss_critical_wis <- eval_highmiss %>%
-  group_by(subgroup_critical) %>%
-  summarise(
-    n_group = n(),
-    
-    DRF = wis_one(y, drf_q05, drf_q50, drf_q95),
-    QRF = wis_one(y, qrf_q05, qrf_q50, qrf_q95),
-    RF  = wis_one(y, rf_q05,  rf_q50,  rf_q95),
-    XGB = wis_one(y, xgb_q05, xgb_q50, xgb_q95),
-    
-    .groups = "drop"
-  ) %>%
-  pivot_longer(
-    cols = c(DRF, QRF, RF, XGB),
-    names_to = "model",
-    values_to = "WIS"
-  )
-
-out_highmiss_critical_wis
-
-eval_highmiss2 <- eval_df %>%
+eval_hm <- eval_df %>%
   filter(miss_group == "High missing") %>%
   mutate(
-    critical_or = case_when(
-      vent_group == "Ventilated" | vaso_group == "Vasopressors" ~
-        "High missing + Vent OR Vaso",
-      TRUE ~
-        "High missing only"
-    )
+    drf_w = drf_q95 - drf_q05,
+    qrf_w = qrf_q95 - qrf_q05,
+    rf_w  = rf_q95  - rf_q05,
+    xgb_w = xgb_q95 - xgb_q05
+  ) %>%
+  mutate(
+    drf_uncert = ifelse(ntile(drf_w, 2) == 2, "High uncertainty", "Low uncertainty"),
+    qrf_uncert = ifelse(ntile(qrf_w, 2) == 2, "High uncertainty", "Low uncertainty"),
+    rf_uncert  = ifelse(ntile(rf_w,  2) == 2, "High uncertainty", "Low uncertainty"),
+    xgb_uncert = ifelse(ntile(xgb_w, 2) == 2, "High uncertainty", "Low uncertainty")
   )
 
-out_highmiss_or_wis <- eval_highmiss2 %>%
-  group_by(critical_or) %>%
+table(eval_hm$drf_uncert)
+table(eval_hm$qrf_uncert)
+table(eval_hm$rf_uncert)
+table(eval_hm$xgb_uncert)
+
+wis_subset <- function(y, q05, q50, q95, idx) {
+  pred <- cbind(q05[idx], q50[idx], q95[idx])
+  qs   <- c(0.05, 0.5, 0.95)
+  mean(scoringutils::wis(
+    observed = y[idx],
+    predicted = pred,
+    quantile_level = qs,
+    na.rm = TRUE
+  ))
+}
+
+library(dplyr)
+library(tidyr)
+
+out_uncert_wis <- eval_hm %>%
   summarise(
-    n_group = n(),
+    DRF_low  = wis_subset(y, drf_q05, drf_q50, drf_q95, drf_uncert=="Low uncertainty"),
+    DRF_high = wis_subset(y, drf_q05, drf_q50, drf_q95, drf_uncert=="High uncertainty"),
     
-    DRF = wis_one(y, drf_q05, drf_q50, drf_q95),
-    QRF = wis_one(y, qrf_q05, qrf_q50, qrf_q95),
-    RF  = wis_one(y, rf_q05,  rf_q50,  rf_q95),
-    XGB = wis_one(y, xgb_q05, xgb_q50, xgb_q95),
+    QRF_low  = wis_subset(y, qrf_q05, qrf_q50, qrf_q95, qrf_uncert=="Low uncertainty"),
+    QRF_high = wis_subset(y, qrf_q05, qrf_q50, qrf_q95, qrf_uncert=="High uncertainty"),
     
-    .groups = "drop"
+    RF_low   = wis_subset(y, rf_q05,  rf_q50,  rf_q95,  rf_uncert=="Low uncertainty"),
+    RF_high  = wis_subset(y, rf_q05,  rf_q50,  rf_q95,  rf_uncert=="High uncertainty"),
+    
+    XGB_low  = wis_subset(y, xgb_q05, xgb_q50, xgb_q95, xgb_uncert=="Low uncertainty"),
+    XGB_high = wis_subset(y, xgb_q05, xgb_q50, xgb_q95, xgb_uncert=="High uncertainty")
   ) %>%
   pivot_longer(
-    cols = c(DRF, QRF, RF, XGB),
-    names_to = "model",
+    everything(),
+    names_to = c("model","uncert"),
+    names_sep = "_",
     values_to = "WIS"
   )
 
-out_highmiss_or_wis
+out_uncert_wis
 
+out_uncert_n <- tibble(
+  model = c("DRF","QRF","RF","XGB"),
+  low_n  = c(sum(eval_hm$drf_uncert=="Low uncertainty"),
+             sum(eval_hm$qrf_uncert=="Low uncertainty"),
+             sum(eval_hm$rf_uncert=="Low uncertainty"),
+             sum(eval_hm$xgb_uncert=="Low uncertainty")),
+  high_n = c(sum(eval_hm$drf_uncert=="High uncertainty"),
+             sum(eval_hm$qrf_uncert=="High uncertainty"),
+             sum(eval_hm$rf_uncert=="High uncertainty"),
+             sum(eval_hm$xgb_uncert=="High uncertainty"))
+)
+
+out_uncert_n
+
+cov_width_subset <- function(y, q05, q95, idx) {
+  covered <- (y[idx] >= q05[idx]) & (y[idx] <= q95[idx])
+  tibble(
+    coverage = mean(covered, na.rm = TRUE),
+    width    = mean(q95[idx] - q05[idx], na.rm = TRUE),
+    n        = sum(idx)
+  )
+}
+
+library(dplyr)
+library(tidyr)
+
+out_uncert_cov <- bind_rows(
+  
+  # DRF
+  cov_width_subset(eval_hm$y, eval_hm$drf_q05, eval_hm$drf_q95,
+                   eval_hm$drf_uncert == "Low uncertainty") %>%
+    mutate(model = "DRF", uncert = "Low"),
+  
+  cov_width_subset(eval_hm$y, eval_hm$drf_q05, eval_hm$drf_q95,
+                   eval_hm$drf_uncert == "High uncertainty") %>%
+    mutate(model = "DRF", uncert = "High"),
+  
+  # QRF
+  cov_width_subset(eval_hm$y, eval_hm$qrf_q05, eval_hm$qrf_q95,
+                   eval_hm$qrf_uncert == "Low uncertainty") %>%
+    mutate(model = "QRF", uncert = "Low"),
+  
+  cov_width_subset(eval_hm$y, eval_hm$qrf_q05, eval_hm$qrf_q95,
+                   eval_hm$qrf_uncert == "High uncertainty") %>%
+    mutate(model = "QRF", uncert = "High"),
+  
+  # RF
+  cov_width_subset(eval_hm$y, eval_hm$rf_q05, eval_hm$rf_q95,
+                   eval_hm$rf_uncert == "Low uncertainty") %>%
+    mutate(model = "RF", uncert = "Low"),
+  
+  cov_width_subset(eval_hm$y, eval_hm$rf_q05, eval_hm$rf_q95,
+                   eval_hm$rf_uncert == "High uncertainty") %>%
+    mutate(model = "RF", uncert = "High"),
+  
+  # XGB
+  cov_width_subset(eval_hm$y, eval_hm$xgb_q05, eval_hm$xgb_q95,
+                   eval_hm$xgb_uncert == "Low uncertainty") %>%
+    mutate(model = "XGB", uncert = "Low"),
+  
+  cov_width_subset(eval_hm$y, eval_hm$xgb_q05, eval_hm$xgb_q95,
+                   eval_hm$xgb_uncert == "High uncertainty") %>%
+    mutate(model = "XGB", uncert = "High")
+  
+)
+
+out_uncert_cov
+
+library(ggplot2)
+
+ggplot(out_uncert_cov, aes(x = uncert, y = coverage, color = model, group = model)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0.90, linetype = "dashed", color = "red") +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Coverage under High Missingness",
+    subtitle = "Stratified by model-predicted uncertainty",
+    x = "Predicted uncertainty stratum",
+    y = "Empirical Coverage"
+  )
+
+ggplot(out_uncert_cov, aes(x = uncert, y = width, color = model, group = model)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Interval Width under High Missingness",
+    x = "Predicted uncertainty stratum",
+    y = "Average Interval Width"
+  )
 
 # ----- conditional calibration ----------#
 library(dplyr)
