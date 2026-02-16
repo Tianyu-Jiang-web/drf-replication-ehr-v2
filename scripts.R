@@ -2,10 +2,11 @@ library(dplyr)
 library(readr)
 library(lubridate)
 
+# read the dataset
+df <- read.csv("data/FINAL_master_dataset_9Feb2026(in).csv") %>%
+  filter(!is.na(icu_los_days))
 
-df <- read.csv("data/final_master_dataset_9Dec2025 1(in).csv") %>%
-  filter(!is.na(los))
-
+# variable mapping
 race_mapping <- c(
   "WHITE" = "White",
   "WHITE - OTHER EUROPEAN" = "White",
@@ -47,6 +48,7 @@ race_mapping <- c(
   "SOUTH AMERICAN" = "Hispanic/Latino"
 )
 
+# create race clean variable and outcome variable
 df2 <- df %>%
   mutate(
     race = trimws(as.character(race)),
@@ -54,147 +56,73 @@ df2 <- df %>%
     race_clean = factor(race_clean,
                         levels = c("White", "Black", "Asian",
                                    "Hispanic/Latino", "Other", "Unknown")),
-    y = los
+    y = icu_los_days
   )
 
+# build a dropping vector
 drop_cols <- c(
   "stay_id",
   "race",
   "admittime","dischtime","icu_intime_first","icu_outtime_first","intime",
   "primary_icd_long_title","primary_icd_code",
   "readmit_30d","readmit_90d","readmit_180d",
-  "los"
+  "icu_los_days"
 )
 
+# drop the column based on created vector
 df2 <- df2 %>% select(-any_of(drop_cols))
 
-# -----------------------
-# 2) labs：只保留你指定的 labs（优先 *_latest），并手动删除多余亚型
-# -----------------------
 
-# 2.1 先手动删掉你不想要的亚型（含其 *_latest）
-df2 <- df2 %>% select(
-  -Albumin_Blood_latest,
-  
-  -Potassium_Ascites, -Potassium_Ascites_latest,
-  -Potassium_BodyFluid, -Potassium_BodyFluid_latest,
-  -Potassium_Pleural, -Potassium_Pleural_latest,
-  -Potassium_Stool, -Potassium_Stool_latest,
-  -Potassium_Urine, -Potassium_Urine_latest,
-  -Potassium_WholeBlood, -Potassium_WholeBlood_latest,
-  -Potassium_CSF_latest,
-  -Potassium_JointFluid_latest,
-  
-  -Sodium_Ascites, -Sodium_Ascites_latest,
-  -Sodium_BodyFluid, -Sodium_BodyFluid_latest,
-  -Sodium_Pleural, -Sodium_Pleural_latest,
-  -Sodium_Stool, -Sodium_Stool_latest,
-  -Sodium_Urine, -Sodium_Urine_latest,
-  -Sodium_WholeBlood, -Sodium_WholeBlood_latest,
-  -Sodium_CSF_latest,
-  -Sodium_JointFluid_latest,
+names(df2) <- sub("_final$", "", names(df2))
 
-  -Triglycerides_Ascites, -Triglycerides_Ascites_latest,
-  -Triglycerides_Pleural, -Triglycerides_Pleural_latest,
-  -Triglycerides_CSF_latest,
-  -Triglycerides_JointFluid_latest,
-  -Triglycerides_Stool_latest,
-  
-  -Urea.Nitrogen_Ascites, -Urea.Nitrogen_Ascites_latest,
-  -Urea.Nitrogen_Body.Fluid, -Urea.Nitrogen_Body.Fluid_latest,
-  -Urea.Nitrogen_Pleural, -Urea.Nitrogen_Pleural_latest,
-  -Urea.Nitrogen_Urine, -Urea.Nitrogen_Urine_latest,
-  -Urea.Nitrogen_CSF_latest,
-  -Urea.Nitrogen_Joint.Fluid_latest
-  )
 
-# 2.2 只对你指定的“主 labs”做 latest -> base（无循环版，逐条写清楚）
-#     规则：如果 *_latest 存在，用 *_latest 替代 base；否则保留 base（如果存在）
-df2 <- df2 %>%
-  mutate(
-    Albumin            = coalesce(Albumin_latest, Albumin),
-    Creatinine         = coalesce(Creatinine_latest, Creatinine),
-    HDL                = coalesce(HDL_latest, HDL),
-    INR                = coalesce(INR_latest, INR),
-    LDL                = coalesce(LDL_latest, LDL),
-    PT                 = coalesce(PT_latest, PT),
-    PTT                = coalesce(PTT_latest, PTT),
-    Phosphate          = coalesce(Phosphate_latest, Phosphate),
-    Potassium_Blood    = coalesce(Potassium_Blood_latest, Potassium_Blood),
-    Sodium_Blood       = coalesce(Sodium_Blood_latest, Sodium_Blood),
-    Temperature        = coalesce(Temperature_latest, Temperature),
-    TotalChol          = coalesce(TotalChol_latest, TotalChol),
-    Triglycerides_Blood= coalesce(Triglycerides_Blood_latest, Triglycerides_Blood),
-    Urea.Nitrogen      = coalesce(Urea.Nitrogen_latest, Urea.Nitrogen),
-    WBC                = coalesce(WBC_latest, WBC),
-    eGFR               = coalesce(eGFR_latest, eGFR)
-  ) %>%
-  # 2.3 再把这些 *_latest 列删掉（避免残留）
-  select(
-    -Albumin_latest,
-    -Creatinine_latest,
-    -HDL_latest,
-    -INR_latest,
-    -LDL_latest,
-    -PT_latest,
-    -PTT_latest,
-    -Phosphate_latest,
-    -Potassium_Blood_latest,
-    -Sodium_Blood_latest,
-    -Temperature_latest,
-    -TotalChol_latest,
-    -Triglycerides_Blood_latest,
-    -Urea.Nitrogen_latest,
-    -WBC_latest,
-    -eGFR_latest
-  )
+# transfer categories variables as factor
 
-# -----------------------
-# 3) 分类变量转 factor
-# -----------------------
 cat_cols <- intersect(c("race_clean","marital_status","insurance","gender","first_careunit"), names(df2))
 df2 <- df2 %>% mutate(across(all_of(cat_cols), ~as.factor(trimws(.x))))
 
-# -----------------------
-# 4) 缺失指示器：对数值列生成 *_miss
-#    (不填补也行，但 indicator 让比较更公平)
-# -----------------------
+# select all numeric variables except for los
 num_cols <- names(df2)[sapply(df2, is.numeric)]
 num_cols <- setdiff(num_cols, "y")
-
+# Create a new column named original_variable + "_miss"
+# Assign 1 if missing, 0 otherwise
 for (v in num_cols) {
   df2[[paste0(v, "_miss")]] <- as.integer(is.na(df2[[v]]))
 }
 
-# -----------------------
-# 5) 给非树模型准备一个“能训练”的填补版本（保留 miss 指示器）
-#    (树模型可直接用原 df2; 但 baseline 一般需要这个)
-# -----------------------
-
+# prepare a imputed dataset for QRF
+# extract and parse admission time from the original dataframe
 df_time <- df %>%
-  mutate(admit_dt = mdy_hm(admittime)) %>%
+  mutate(admit_dt = dmy_hm(admittime)) %>%
   select(subject_id, hadm_id, admit_dt)
 
+# Merge admission datetime into df2
 df2 <- df2 %>%
   left_join(df_time, by = c("subject_id","hadm_id"))
+
+# Remove ID variables and their missingness indicators
 df2 <- df2 %>% select(-subject_id, -hadm_id, -subject_id_miss, -hadm_id_miss)
 
+# create a new dataframe with median imputation applied on its numeric variables
 df_imp <- df2
 for (v in num_cols) {
   med <- median(df_imp[[v]], na.rm = TRUE)
   df_imp[[v]][is.na(df_imp[[v]])] <- med
 }
-# 分类缺失：显式一个水平
+# for categorical variables with missing values, assign level "unknown" to them
 for (v in cat_cols) {
   df_imp[[v]] <- addNA(df_imp[[v]])
   levels(df_imp[[v]])[is.na(levels(df_imp[[v]]))] <- "Unknown"
 }
 
 
-# 最终：
+# finalize the dataset
+# using los as outcome variable
 y <- df2$y
-X_tree <- df2 %>% select(-y)     # DRF / 树模型用（允许 NA）
-X_all  <- df_imp %>% select(-y)  # 需要无 NA 的 baseline 用
+# X_tree dataset for DRF/tree model
+X_tree <- df2 %>% select(-y)
+# X_all dataset for QRF model
+X_all  <- df_imp %>% select(-y)
 
 
 #-----------------------------------
@@ -203,32 +131,34 @@ X_all  <- df_imp %>% select(-y)  # 需要无 NA 的 baseline 用
 
 
 # 1-data split
-library(lubridate)
 
 
-# ---- time split (用 admit_dt 只做划分) ----
+# split data based on admission time
 cutoff <- quantile(df2$admit_dt, 0.8, na.rm = TRUE)
+# select data with 80% previous admission time as training set
 idx_train <- which(df2$admit_dt <= cutoff)
+# select data with 20% later admission time as test set
 idx_test  <- which(df2$admit_dt >  cutoff)
 
-# ---- 进入模型前，删掉 admit_dt（不当特征）----
+# delete variable admit_dt
 df2_model <- df2 %>% select(-admit_dt)
 
-# 最终：
+# update y and X_tree
 y      <- df2_model$y
-X_tree <- df2_model %>% select(-y)      # DRF/tree 用（允许 NA）
+X_tree <- df2_model %>% select(-y)
 
-# ⚠️ baseline 的 df_imp 也要同步删掉 id + admit_dt（见下一段）
+# delete admit_dt from df_imp2 and X_all
 df_imp2 <- df_imp %>%
-  select(-any_of(c("subject_id","hadm_id","subject_id_miss","hadm_id_miss","admit_dt")))  # admit_dt 不存在也没关系
+  select(-any_of(c("admit_dt")))
 X_all <- df_imp2 %>% select(-y)
 
-# split
+# split X_tree training set and test set based on idx_train and idx_test
 Xtr_tree <- X_tree[idx_train, ]
 Xte_tree <- X_tree[idx_test, ]
+# split y training set and test set based on idx_train and idx_test
 y_tr     <- y[idx_train]
 y_te     <- y[idx_test]
-
+# split X_all training set and test set based on idx_train and idx_test
 Xtr_all  <- X_all[idx_train, ]
 Xte_all  <- X_all[idx_test, ]
 
@@ -237,6 +167,7 @@ library(drf)
 
 set.seed(2026)
 
+# fit DRF
 drf_fit <- drf(
   X = Xtr_tree,
   Y = y_tr,
@@ -246,37 +177,41 @@ drf_fit <- drf(
   sample.fraction = 0.5
 )
 
-
+# set 3 quantile levels for calculating WIS
 q_levels <- c(0.05, 0.5, 0.95)
 
-drf_pred <- predict(drf_fit, Xte_tree, quantiles = q_levels)
+# get the prediction outcome
+# the outcome includes weights align with y and y
+drf_pred <- predict(drf_fit, Xte_tree)
 
 library(Matrix)
 
-q_levels <- c(0.05, 0.5, 0.95)
-
+# set a range of quantiles level
 q_grid <- seq(0.05, 0.95, by = 0.05)   # 19个分位数
 
-# drf_pred <- predict(drf_fit, Xte_tree)  # 你已经有了
-W <- drf_pred$weights      # n_test x n_train, dgCMatrix
-y_train <- as.numeric(drf_pred$y)  # 训练集 y（LOS）
+# get weight from the outcome
+W <- drf_pred$weights  # n_test x n_train, dgCMatrix
+y_train <- as.numeric(drf_pred$y)  # get y_train from drf_pred to have the same sequence as weight
 
-# 加权分位数：输入 y_train 和一条权重向量 w
+# build a function to get the los for selected quantile
 wquant <- function(y, w, probs) {
-  # w 是 numeric 向量（长度 n_train）
+  # order by los
   o <- order(y)
   y <- y[o]
+  # select the weight which is matched with y's order
   w <- w[o]
   cw <- cumsum(w) / sum(w)
+  # to get the exact y
   sapply(probs, function(p) y[which(cw >= p)[1]])
 }
 
-# 从稀疏矩阵取每一行的权重并计算分位数
+# calculate predicted LOS quantiles for each test observation
 drf_q_mat <- t(sapply(1:nrow(W), function(i) {
   w <- as.numeric(W[i, ])
   wquant(y_train, w, q_levels)
 }))
 
+# transfer drf_q_mat as dataframe and name 3 columns (q05, q50, q95)
 drf_q <- as.data.frame(drf_q_mat)
 colnames(drf_q) <- c("q05","q50","q95")
 
@@ -286,13 +221,17 @@ drf_qgrid_mat <- t(sapply(1:nrow(W), function(i) {
   wquant(y_train, w, q_grid)
 }))
 
+# transfer drf_q_mat as dataframe
 drf_qgrid <- as.data.frame(drf_qgrid_mat)
 colnames(drf_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
-# 例如 q05 q10 ... q95
-# 3-fit QRF
 
+
+# 3-fit QRF
+# Load qrf package
 library(quantregForest)
 
+# fit qrf model
+# qrf keeps all training responses in each terminal node
 qrf_fit <- quantregForest(
   x = Xtr_all,
   y = y_tr,
@@ -300,6 +239,7 @@ qrf_fit <- quantregForest(
   nodesize = 50
 )
 
+# predict the outcome and store in dataframe format
 qrf_q <- as.data.frame(
   predict(qrf_fit, Xte_all, what = q_levels)
 )
@@ -311,9 +251,10 @@ colnames(qrf_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
 
 
 # 4-fit ranger
-
+# loading the package
 library(ranger)
 
+# fit the random forest model
 rf_q_fit <- ranger(
   x = Xtr_all,
   y = y_tr,
@@ -323,6 +264,7 @@ rf_q_fit <- ranger(
   keep.inbag = TRUE
 )
 
+# get the results and store in dataframe format
 rf_q <- as.data.frame(
   predict(rf_q_fit, Xte_all, type = "quantiles", quantiles = q_levels)$predictions
 )
@@ -338,27 +280,32 @@ colnames(rf_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
 # 5-XGBoost + Conformal prediction
 
 set.seed(2026)
+# extract calibration set based on training set
 n_tr <- length(y_tr)
 cal_idx <- sample(seq_len(n_tr), size = floor(0.2 * n_tr))
 
+# build calibration set
 X_cal <- Xtr_all[cal_idx, ]
 y_cal <- y_tr[cal_idx]
 
+# build training set
 X_tr2 <- Xtr_all[-cal_idx, ]
 y_tr2 <- y_tr[-cal_idx]
 
-
+# load the package
 library(xgboost)
 
-# 构建设计矩阵（自动 one-hot）
+# apply one-hot code as XGBoost can't deal with factor
 X_tr2_mm <- model.matrix(~ . - 1, data = X_tr2)
 X_cal_mm <- model.matrix(~ . - 1, data = X_cal)
 X_te_mm  <- model.matrix(~ . - 1, data = Xte_all)
 
+# build DMatrix
 dtrain <- xgb.DMatrix(X_tr2_mm, label = y_tr2)
 dcal   <- xgb.DMatrix(X_cal_mm, label = y_cal)
 dtest  <- xgb.DMatrix(X_te_mm)
 
+# parameters setting
 params <- list(
   objective = "reg:squarederror",
   max_depth = 6,
@@ -367,6 +314,7 @@ params <- list(
   colsample_bytree = 0.8
 )
 
+# model training
 xgb_fit <- xgb.train(
   params = params,
   data   = dtrain,
@@ -374,45 +322,61 @@ xgb_fit <- xgb.train(
   verbose = 0
 )
 
+# predict the result on calibration set
 pred_cal <- predict(xgb_fit, dcal)
+# calculate the residual for the results of calibration prediction
 resid <- abs(y_cal - pred_cal)
 
+# calculate conformal quantile
 alpha <- 0.1
 q_hat <- quantile(resid, 1 - alpha)
 
+# get the test set prediciton result
 pred_test <- predict(xgb_fit, dtest)
 
+# create a dataframe to get results for each quantile
+lower_bound <- min(y_tr, na.rm = TRUE)  
 xgb_q <- data.frame(
-  q05 = pred_test - q_hat,
+  q05 = pmax(pred_test - q_hat, lower_bound),
   q50 = pred_test,
   q95 = pred_test + q_hat
 )
 
 # ---- XGB conformal quantile grid predictions (NEW) ----
-scale_tau <- (q_grid - 0.5) / 0.5   # 0.05->-0.9, 0.95->+0.9 (注意不是±1)
-# 这会让 q05/q95 不再等于你原来 pred±q_hat（原来相当于tau=0.0/1.0的极端）
-# 为了“保持一致”，我们用一种更贴近你原设置的方式：把 0.05/0.95 映射到 ±1
+# map quantile levels to symmetric scale [-1, 1]
+# so that 0.05 -> -1 and 0.95 -> +1
 scale_tau2 <- (q_grid - 0.5) / 0.45  # 0.05->-1, 0.95->+1
 
+
+# Construct pseudo-quantile predictions:
+# center at point prediction (pred_test)
+# expand linearly using conformal radius (q_hat)
 xgb_qgrid_mat <- sapply(scale_tau2, function(s) pred_test + s * q_hat)
+
+# Convert to data frame and assign quantile names
 xgb_qgrid <- as.data.frame(xgb_qgrid_mat)
 colnames(xgb_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
 
 # evaluation
-
+# Evaluate prediction interval performance
 eval_interval <- function(q, y) {
+  # Indicator whether the true value lies inside the interval
   covered <- (y >= q$q05) & (y <= q$q95)
   list(
+    # Empirical coverage rate
     coverage = mean(covered),
+    # Average interval width
     width    = mean(q$q95 - q$q05)
   )
 }
 
+# evaluate our models using the function defined
 res_drf <- eval_interval(drf_q, y_te)
 res_qrf <- eval_interval(qrf_q, y_te)
 res_rf  <- eval_interval(rf_q,  y_te)
 res_xgb <- eval_interval(xgb_q, y_te)
 
+# combine the results as a table
 rbind(
   DRF = unlist(res_drf),
   QRF = unlist(res_qrf),
@@ -420,12 +384,15 @@ rbind(
   XGB = unlist(res_xgb)
 )
 
-
+# library scoringutils to use wis function
 install.packages("scoringutils")
 library(scoringutils)
 
+# Compute mean Weighted Interval Score
 wis_score <- function(q, y, na.rm = TRUE) {
+  # Extract quantile predictions
   pred <- as.matrix(q[, c("q05", "q50", "q95")])
+  # Compute WIS using scoringutils
   scoringutils::wis(
     observed = y,
     predicted = pred,
@@ -434,6 +401,7 @@ wis_score <- function(q, y, na.rm = TRUE) {
   ) |> mean(na.rm = na.rm)
 }
 
+# compare wis score for our models
 c(
   DRF = wis_score(drf_q, y_te),
   QRF = wis_score(qrf_q, y_te),
@@ -443,37 +411,41 @@ c(
 
 # --------- Subgroup analysis ----------------#
 
+# Build an evaluation dataframe
 eval_df <- data.frame(
+  # True outcomes on test set
   y = y_te,
-  
+  # DRF predicted quantiles
   drf_q05 = drf_q$q05,
   drf_q50 = drf_q$q50,
   drf_q95 = drf_q$q95,
-  
+  # QRF predicted quantiles
   qrf_q05 = qrf_q$q05,
   qrf_q50 = qrf_q$q50,
   qrf_q95 = qrf_q$q95,
-  
+  # Random Forest (quantile) predicted quantiles
   rf_q05  = rf_q$q05,
   rf_q50  = rf_q$q50,
   rf_q95  = rf_q$q95,
-  
+  # XGBoost + conformal predicted quantiles/interval endpoints
   xgb_q05 = xgb_q$q05,
   xgb_q50 = xgb_q$q50,
   xgb_q95 = xgb_q$q95
 )
-
+# Subgroup 1: group by outcome (LOS) ranges
 eval_df$los_group <- cut(
   eval_df$y,
   breaks = c(-Inf, 3, 7, Inf),
   labels = c("Short (≤3d)", "Medium (3–7d)", "Long (>7d)")
 )
 
-# 用 Xte_tree（保留 NA 的版本）
+# Use Xte_tree (the version that allows NA) to compute miss_rate）
 miss_mat <- is.na(Xte_tree)
 
+# Row-wise missing rate: proportion of NA in each test row
 eval_df$miss_rate <- rowMeans(miss_mat)
 
+# Subgroup 2: group by missingness into terciles (low/mid/high)
 eval_df$miss_group <- cut(
   eval_df$miss_rate,
   breaks = quantile(eval_df$miss_rate, probs = c(0, 1/3, 2/3, 1)),
@@ -481,35 +453,40 @@ eval_df$miss_group <- cut(
   include.lowest = TRUE
 )
 
+# Subgroup 3: ventilation status (binary)
 eval_df$vent_group <- factor(
-  Xte_tree$vent_any_flag,
+  Xte_tree$vent_any,
   levels = c(0, 1),
   labels = c("No ventilation", "Ventilated")
 )
 
+# Subgroup 4: vasopressors status (binary)
 eval_df$vaso_group <- factor(
   Xte_tree$vasopressors,
   levels = c(0, 1),
   labels = c("No vasopressors", "Vasopressors")
 )
 
-library(dplyr)
-library(tidyr)
-
+# Helper: compute coverage, width, and number of valid cases
 eval_metrics_vec <- function(q05, q95, y) {
+  # Indicator: whether y is inside [q05, q95]
   covered <- (y >= q05) & (y <= q95)
   tibble(
+    # Empirical coverage = mean of indicator
     coverage = mean(covered, na.rm = TRUE),
+    # Average interval width
     width    = mean(q95 - q05, na.rm = TRUE),
+    # Number of observations used (non-missing covered)
     n_used   = sum(!is.na(covered))
   )
 }
 
+# Evaluate interval metrics by missingness subgroup, for each model
 out_miss_long <- eval_df %>%
   group_by(miss_group) %>%
   summarise(
     n_group = n(),
-    
+    # For each model, compute interval metrics and store as a list-column
     DRF = list(eval_metrics_vec(.data$drf_q05, .data$drf_q95, .data$y)),
     QRF = list(eval_metrics_vec(.data$qrf_q05, .data$qrf_q95, .data$y)),
     RF  = list(eval_metrics_vec(.data$rf_q05,  .data$rf_q95,  .data$y)),
@@ -517,17 +494,21 @@ out_miss_long <- eval_df %>%
     
     .groups = "drop"
   ) %>%
+  # Convert wide model columns into long format
   pivot_longer(cols = c(DRF, QRF, RF, XGB), names_to = "model", values_to = "metrics") %>%
+  # Expand the tibble stored in list-column
   unnest(metrics)
 
+# show the result
 out_miss_long
 
 
-library(dplyr)
-
+# Helper: compute mean WIS for one model within a subgroup
 wis_one <- function(y, q05, q50, q95) {
+  # Build predicted quantiles matrix: each row is one case, columns are (q05,q50,q95)
   pred <- cbind(q05, q50, q95)
   qs   <- c(0.05, 0.5, 0.95)
+  # scoringutils::wis returns a vector of WIS values (one per observation)
   mean(scoringutils::wis(
     observed = y,
     predicted = pred,
@@ -535,7 +516,7 @@ wis_one <- function(y, q05, q50, q95) {
     na.rm = TRUE
   ))
 }
-
+# Evaluate WIS by missingness subgroup for each model
 out_miss_wis <- eval_df %>%
   group_by(miss_group) %>%
   summarise(
@@ -550,12 +531,12 @@ out_miss_wis <- eval_df %>%
 out_miss_wis
 
 # group by ventilation / vasopressors
-
+# Evaluate interval metrics within ventilation subgroups
 out_vent_long <- eval_df %>%
   group_by(vent_group) %>%
   summarise(
     n_group = n(),
-    
+    # Compute coverage and width for each model
     DRF = list(eval_metrics_vec(drf_q05, drf_q95, y)),
     QRF = list(eval_metrics_vec(qrf_q05, qrf_q95, y)),
     RF  = list(eval_metrics_vec(rf_q05,  rf_q95,  y)),
@@ -566,10 +547,11 @@ out_vent_long <- eval_df %>%
   pivot_longer(cols = c(DRF, QRF, RF, XGB),
                names_to = "model",
                values_to = "metrics") %>%
+  # Expand list-column into separate columns
   unnest(metrics)
 
 out_vent_long
-
+# Compute subgroup-specific WIS by ventilation status
 out_vent_wis <- eval_df %>%
   group_by(vent_group) %>%
   summarise(
@@ -583,7 +565,7 @@ out_vent_wis <- eval_df %>%
 
 out_vent_wis
 
-
+# Compute subgroup-specific WIS by vasopressor status
 out_vaso_wis <- eval_df %>%
   group_by(vaso_group) %>%
   summarise(
@@ -599,16 +581,18 @@ out_vaso_wis
 
 # -------- multi-subgroup test ---------#
 
-library(dplyr)
-
+# Restrict analysis to the high-missingness subgroup
 eval_hm <- eval_df %>%
   filter(miss_group == "High missing") %>%
+  # Compute interval width as a proxy for predictive uncertainty
   mutate(
     drf_w = drf_q95 - drf_q05,
     qrf_w = qrf_q95 - qrf_q05,
     rf_w  = rf_q95  - rf_q05,
     xgb_w = xgb_q95 - xgb_q05
   ) %>%
+  # Split each model's predictions into high vs low uncertainty 
+  # based on interval width (median split)
   mutate(
     drf_uncert = ifelse(ntile(drf_w, 2) == 2, "High uncertainty", "Low uncertainty"),
     qrf_uncert = ifelse(ntile(qrf_w, 2) == 2, "High uncertainty", "Low uncertainty"),
@@ -616,11 +600,13 @@ eval_hm <- eval_df %>%
     xgb_uncert = ifelse(ntile(xgb_w, 2) == 2, "High uncertainty", "Low uncertainty")
   )
 
+# calculate the sample siz
 table(eval_hm$drf_uncert)
 table(eval_hm$qrf_uncert)
 table(eval_hm$rf_uncert)
 table(eval_hm$xgb_uncert)
 
+# build a function to compute mean WIS on a subset defined by idx
 wis_subset <- function(y, q05, q50, q95, idx) {
   pred <- cbind(q05[idx], q50[idx], q95[idx])
   qs   <- c(0.05, 0.5, 0.95)
@@ -632,9 +618,7 @@ wis_subset <- function(y, q05, q50, q95, idx) {
   ))
 }
 
-library(dplyr)
-library(tidyr)
-
+# apply the function to calculate wis for each model in different uncertainty risk
 out_uncert_wis <- eval_hm %>%
   summarise(
     DRF_low  = wis_subset(y, drf_q05, drf_q50, drf_q95, drf_uncert=="Low uncertainty"),
@@ -657,7 +641,7 @@ out_uncert_wis <- eval_hm %>%
   )
 
 out_uncert_wis
-
+# compute the number of each group
 out_uncert_n <- tibble(
   model = c("DRF","QRF","RF","XGB"),
   low_n  = c(sum(eval_hm$drf_uncert=="Low uncertainty"),
@@ -672,6 +656,7 @@ out_uncert_n <- tibble(
 
 out_uncert_n
 
+# Compute coverage and interval width on subset idx
 cov_width_subset <- function(y, q05, q95, idx) {
   covered <- (y[idx] >= q05[idx]) & (y[idx] <= q95[idx])
   tibble(
@@ -681,9 +666,7 @@ cov_width_subset <- function(y, q05, q95, idx) {
   )
 }
 
-library(dplyr)
-library(tidyr)
-
+# combine all the results
 out_uncert_cov <- bind_rows(
   
   # DRF
@@ -726,8 +709,7 @@ out_uncert_cov <- bind_rows(
 
 out_uncert_cov
 
-library(ggplot2)
-
+# draw the plot for the results
 ggplot(out_uncert_cov, aes(x = uncert, y = coverage, color = model, group = model)) +
   geom_line(linewidth = 0.9) +
   geom_point(size = 2) +
@@ -751,38 +733,111 @@ ggplot(out_uncert_cov, aes(x = uncert, y = width, color = model, group = model))
   )
 
 # ----- conditional calibration ----------#
-library(dplyr)
-library(tidyr)
-library(ggplot2)
 
-# --- 1) 重新计算汇总数据，增加二项分布标准误 ---
+# ----------------------------
+# Build cal_df for conditional calibration
+# ----------------------------
+
+<- 10  # number of bins
+
+# ----------------------------
+# Build cal_df safely
+# ----------------------------
+
+cal_df <- bind_rows(
+  
+  # DRF
+  eval_df %>%
+    transmute(
+      model = "DRF",
+      y,
+      q05 = drf_q05,
+      q50 = drf_q50,
+      q95 = drf_q95
+    ),
+  
+  # QRF
+  eval_df %>%
+    transmute(
+      model = "QRF",
+      y,
+      q05 = qrf_q05,
+      q50 = qrf_q50,
+      q95 = qrf_q95
+    ),
+  
+  # RF
+  eval_df %>%
+    transmute(
+      model = "RF",
+      y,
+      q05 = rf_q05,
+      q50 = rf_q50,
+      q95 = rf_q95
+    ),
+  
+  # XGB
+  eval_df %>%
+    transmute(
+      model = "XGB",
+      y,
+      q05 = xgb_q05,
+      q50 = xgb_q50,
+      q95 = xgb_q95
+    )
+  
+) %>%
+  mutate(
+    # predicted median as x-axis
+    x = q50,
+    # coverage indicator
+    covered = (y >= q05) & (y <= q95)
+  ) %>%
+  group_by(model) %>%
+  mutate(
+    # bin by predicted median
+    bin = ntile(x, K)
+  ) %>%
+  group_by(model, bin) %>%
+  summarise(
+    x = mean(x, na.rm = TRUE),
+    coverage = mean(covered, na.rm = TRUE),
+    n_bin = sum(!is.na(covered)),
+    .groups = "drop"
+  )
+
 cal_df_clean <- cal_df %>%
   mutate(
-    # 计算二项分布的标准误，用于绘制误差带
+    # Standard error of binomial proportion
     se = sqrt(coverage * (1 - coverage) / n_bin),
+    # 95% confidence interval bounds
     lower = pmax(0, coverage - 1.96 * se),
     upper = pmin(1, coverage + 1.96 * se)
   )
 
-# --- 2) 绘制精美的可视化图表 ---
+# create the plot for calibration
 ggplot(cal_df_clean, aes(x = x, y = coverage)) +
-  # 90% 目标线（稍微加粗并改为红色虚线，更显眼）
+  # Draw a dashed red reference line for visual comparison
   geom_hline(yintercept = 0.90, linetype = "dashed", color = "red", alpha = 0.6) +
-  # 增加覆盖率的可信区间带（让图表看起来更专业）
+  # Confidence ribbon around empirical coverage
+  # Represents 95% binomial confidence interval
   geom_ribbon(aes(ymin = lower, ymax = upper), fill = "steelblue", alpha = 0.15) +
-  # 绘制折线和统一大小的点
+  # Calibration curve (empirical coverage across bins)
   geom_line(color = "steelblue", size = 0.8) +
+  # Points representing bin-level coverage estimates
   geom_point(color = "steelblue", size = 1.5, alpha = 0.8) +
-  # 分面
+  # Facet by model for side-by-side comparison
   facet_wrap(~ model, ncol = 2) +
-  # 坐标轴与标签美化
+  # Y-axis formatting as percentage and restrict visible range
   scale_y_continuous(labels = scales::percent, limits = c(0.6, 1.0)) +
+  # Labels and title
   labs(
     title = "Conditional Calibration of 90% Prediction Intervals",
     subtitle = "Assessing coverage stability across different LOS risk levels",
     x = "Predicted Median LOS (Days)",
     y = "Empirical Coverage (%)"
   ) +
+  # Clean theme
   theme_bw(base_size = 12) +
   theme(
     strip.background = element_rect(fill = "#f0f0f0"),
@@ -837,10 +892,6 @@ crps_all_grid
 
 
 # ----------
-
-library(dplyr)
-library(tidyr)
-library(ggplot2)
 library(scales)
 
 alpha_target <- 0.90   # 你的区间是 90% (0.05~0.95)
@@ -939,14 +990,11 @@ p_cov_vs_width
 
 # --------- conditional calibration heatmap --------#
 
-library(dplyr)
-library(tidyr)
-library(ggplot2)
 library(scales)
-
+# nominal target coverage level (90%)
 alpha_target <- 0.90
 
-# ---- 0) 组织成长表：每行=一个样本+一个模型，包含 q50, width, covered ----
+# Keep only outcome and predicted quantiles for each model
 long2d <- eval_df %>%
   transmute(
     y,
@@ -956,12 +1004,13 @@ long2d <- eval_df %>%
     rf_q05,  rf_q50,  rf_q95,
     xgb_q05, xgb_q50, xgb_q95
   ) %>%
+  # Compute interval width (uncertainty proxy)
   mutate(
     drf_w = drf_q95 - drf_q05,
     qrf_w = qrf_q95 - qrf_q05,
     rf_w  = rf_q95  - rf_q05,
     xgb_w = xgb_q95 - xgb_q05,
-    
+    # Compute coverage indicator (1 = covered, 0 = not covered)
     drf_cov = as.integer(y >= drf_q05 & y <= drf_q95),
     qrf_cov = as.integer(y >= qrf_q05 & y <= qrf_q95),
     rf_cov  = as.integer(y >= rf_q05  & y <= rf_q95),
@@ -984,10 +1033,10 @@ long2d <- eval_df %>%
   ) %>%
   filter(is.finite(q50), is.finite(w), w >= 0)
 
-
+# Define number of bins for predicted risk and predicted uncertainty
 n_risk_bins <- 10
 n_w_bins    <- 10
-
+# Within each model: Bin by predicted median and interval width
 heat2d_df <- long2d %>%
   group_by(model) %>%
   mutate(
@@ -997,23 +1046,24 @@ heat2d_df <- long2d %>%
   group_by(model, risk_bin, width_bin) %>%
   summarise(
     n_cell   = n(),
-    q50_med  = median(q50, na.rm = TRUE),   # 用于标注/排序也行
+    q50_med  = median(q50, na.rm = TRUE),
     w_med    = median(w,   na.rm = TRUE),
     coverage = mean(cov,   na.rm = TRUE),
     .groups = "drop"
   ) %>%
   mutate(
-    delta = coverage - alpha_target,               # >0 over, <0 under
-    # coverage 的不确定性（可选，用于筛掉n太小的格子）
+    # Deviation from target coverage
+    delta = coverage - alpha_target,
+    # Binomial standard error
     se = sqrt(coverage * (1 - coverage) / n_cell),
     lower = pmax(0, coverage - 1.96 * se),
     upper = pmin(1, coverage + 1.96 * se)
   )
 
-min_n_cell <- 50   # 你可以调 30/50/100
+min_n_cell <- 50
 
-# 固化 delta_plot，保证所有 layer 都能用到
 heat2d_plot <- heat2d_df %>%
+  # Remove unreliable cells (too few samples)
   mutate(
     delta_plot = ifelse(n_cell < min_n_cell, NA_real_, delta)
   )
@@ -1027,6 +1077,7 @@ p_heat_delta <- ggplot(
   scale_x_continuous(breaks = 1:n_risk_bins) +
   scale_y_continuous(breaks = 1:n_w_bins) +
   scale_fill_gradient2(
+    # red -> undercoverage, white -> perfect calibration, green -> overcoverage
     low = "#d73027", mid = "white", high = "#1a9850",
     midpoint = 0,
     labels = percent_format(accuracy = 1),
@@ -1046,9 +1097,9 @@ p_heat_delta <- ggplot(
     plot.title = element_text(face = "bold")
   )
 
-p_heat_delta
 
 p_heat_delta_n <- p_heat_delta +
+  # Overlay sample size per cell
   geom_text(
     data = heat2d_plot %>% filter(!is.na(delta_plot)),
     aes(label = n_cell),
