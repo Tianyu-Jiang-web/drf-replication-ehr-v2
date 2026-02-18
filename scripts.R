@@ -357,6 +357,130 @@ xgb_qgrid_mat <- sapply(scale_tau2, function(s) pred_test + s * q_hat)
 xgb_qgrid <- as.data.frame(xgb_qgrid_mat)
 colnames(xgb_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
 
+# 6-Deep Ensembles (Lakshminarayanan et al., NIPS 2017)
+# Each network outputs mean mu(x) and variance sigma^2(x)
+# Trained with Gaussian NLL as the proper scoring rule
+# Ensemble prediction: mixture of Gaussians -> quantiles via qnorm
+
+library(torch)
+
+set.seed(2026)
+
+# Number of networks in the ensemble (paper recommends M=5)
+M_ens <- 5
+
+# Helper: enforce softplus positivity on variance output
+softplus <- function(x) log(1 + exp(x))
+
+# One-hot encode categorical variables (same as XGBoost section)
+# Deep Ensembles requires fully numeric input matrix
+Xtr_ens_mm <- model.matrix(~ . - 1, data = Xtr_all)
+Xte_ens_mm <- model.matrix(~ . - 1, data = Xte_all)
+
+# Standardise inputs (improves NN training stability)
+x_mean <- colMeans(Xtr_ens_mm)
+x_sd   <- apply(Xtr_ens_mm, 2, sd)
+x_sd[x_sd == 0] <- 1   # avoid division by zero for constant columns
+
+Xtr_ens_sc <- scale(Xtr_ens_mm, center = x_mean, scale = x_sd)
+Xte_ens_sc <- scale(Xte_ens_mm, center = x_mean, scale = x_sd)
+
+# Standardise outcome (helps NLL training; predictions are back-transformed)
+y_mean_ens <- mean(y_tr)
+y_sd_ens   <- sd(y_tr)
+y_tr_sc    <- (y_tr - y_mean_ens) / y_sd_ens
+
+n_input <- ncol(Xtr_ens_sc)
+
+# Convert to torch tensors
+X_tr_t <- torch_tensor(Xtr_ens_sc, dtype = torch_float())
+y_tr_t <- torch_tensor(matrix(y_tr_sc, ncol = 1), dtype = torch_float())
+X_te_t <- torch_tensor(Xte_ens_sc, dtype = torch_float())
+
+# Define a single probabilistic NN: outputs (mu, log_var)
+# Architecture: input -> 128 -> 64 -> 2  (with ReLU activations)
+make_prob_net <- function(n_in) {
+  nn_sequential(
+    nn_linear(n_in, 128),
+    nn_relu(),
+    nn_linear(128, 64),
+    nn_relu(),
+    nn_linear(64, 2)   # output: [mu, raw_var (pre-softplus)]
+  )
+}
+
+# Gaussian NLL loss (proper scoring rule, Eq.1 in paper)
+gauss_nll <- function(pred, y_true) {
+  mu      <- pred[, 1, drop = FALSE]
+  log_var <- pred[, 2, drop = FALSE]
+  # softplus to ensure variance > 0, add small epsilon for stability
+  var     <- torch_log1p(torch_exp(log_var)) + 1e-6
+  loss    <- torch_mean(log_var + (y_true - mu)^2 / var)
+  loss
+}
+
+# Train M independent networks
+ensemble_nets <- vector("list", M_ens)
+
+for (m in seq_len(M_ens)) {
+  cat(sprintf("Training ensemble member %d / %d ...\n", m, M_ens))
+  
+  net   <- make_prob_net(n_input)
+  optim <- optim_adam(net$parameters, lr = 0.001)
+  
+  net$train()
+  for (epoch in seq_len(100)) {
+    optim$zero_grad()
+    pred <- net(X_tr_t)
+    loss <- gauss_nll(pred, y_tr_t)
+    loss$backward()
+    optim$step()
+  }
+  
+  net$eval()
+  ensemble_nets[[m]] <- net
+}
+
+# Predict: collect (mu_m, sigma2_m) from each network on the test set
+with_no_grad({
+  preds_list <- lapply(ensemble_nets, function(net) {
+    out    <- net(X_te_t)
+    mu_sc  <- as.numeric(out[, 1])
+    var_sc <- as.numeric(softplus(as.numeric(out[, 2]))) + 1e-6
+    list(mu = mu_sc, var = var_sc)
+  })
+})
+
+# Mixture-of-Gaussians aggregation (Section 2.4 in paper):
+#   mu*  = mean of mu_m
+#   var* = mean(var_m + mu_m^2) - mu*^2
+mu_mat  <- sapply(preds_list, `[[`, "mu")   # n_test x M
+var_mat <- sapply(preds_list, `[[`, "var")
+
+mu_ens_sc  <- rowMeans(mu_mat)
+var_ens_sc <- rowMeans(var_mat + mu_mat^2) - mu_ens_sc^2
+var_ens_sc <- pmax(var_ens_sc, 1e-6)       # numerical safety
+sd_ens_sc  <- sqrt(var_ens_sc)
+
+# Back-transform to original LOS scale
+mu_ens  <- mu_ens_sc  * y_sd_ens + y_mean_ens
+sd_ens  <- sd_ens_sc  * y_sd_ens
+
+# Extract quantiles from the mixture-Gaussian (Gaussian approximation)
+lower_bound_ens <- min(y_tr, na.rm = TRUE)
+ens_q <- data.frame(
+  q05 = pmax(qnorm(0.05, mean = mu_ens, sd = sd_ens), lower_bound_ens),
+  q50 = qnorm(0.50, mean = mu_ens, sd = sd_ens),
+  q95 = qnorm(0.95, mean = mu_ens, sd = sd_ens)
+)
+
+# Dense quantile grid for CRPS
+ens_qgrid_mat <- sapply(q_grid, function(p)
+  pmax(qnorm(p, mean = mu_ens, sd = sd_ens), lower_bound_ens))
+ens_qgrid <- as.data.frame(ens_qgrid_mat)
+colnames(ens_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
+
+
 # evaluation
 # Evaluate prediction interval performance
 eval_interval <- function(q, y) {
@@ -375,13 +499,15 @@ res_drf <- eval_interval(drf_q, y_te)
 res_qrf <- eval_interval(qrf_q, y_te)
 res_rf  <- eval_interval(rf_q,  y_te)
 res_xgb <- eval_interval(xgb_q, y_te)
+res_ens <- eval_interval(ens_q, y_te)
 
 # combine the results as a table
 rbind(
   DRF = unlist(res_drf),
   QRF = unlist(res_qrf),
   RF  = unlist(res_rf),
-  XGB = unlist(res_xgb)
+  XGB = unlist(res_xgb),
+  ENS = unlist(res_ens)
 )
 
 # library scoringutils to use wis function
@@ -406,7 +532,8 @@ c(
   DRF = wis_score(drf_q, y_te),
   QRF = wis_score(qrf_q, y_te),
   RF  = wis_score(rf_q,  y_te),
-  XGB = wis_score(xgb_q, y_te)
+  XGB = wis_score(xgb_q, y_te),
+  ENS = wis_score(ens_q, y_te)
 )
 
 # --------- Subgroup analysis ----------------#
@@ -430,7 +557,11 @@ eval_df <- data.frame(
   # XGBoost + conformal predicted quantiles/interval endpoints
   xgb_q05 = xgb_q$q05,
   xgb_q50 = xgb_q$q50,
-  xgb_q95 = xgb_q$q95
+  xgb_q95 = xgb_q$q95,
+  # Deep Ensembles predicted quantiles
+  ens_q05 = ens_q$q05,
+  ens_q50 = ens_q$q50,
+  ens_q95 = ens_q$q95
 )
 # Subgroup 1: group by outcome (LOS) ranges
 eval_df$los_group <- cut(
@@ -491,11 +622,12 @@ out_miss_long <- eval_df %>%
     QRF = list(eval_metrics_vec(.data$qrf_q05, .data$qrf_q95, .data$y)),
     RF  = list(eval_metrics_vec(.data$rf_q05,  .data$rf_q95,  .data$y)),
     XGB = list(eval_metrics_vec(.data$xgb_q05, .data$xgb_q95, .data$y)),
+    ENS = list(eval_metrics_vec(.data$ens_q05, .data$ens_q95, .data$y)),
     
     .groups = "drop"
   ) %>%
   # Convert wide model columns into long format
-  pivot_longer(cols = c(DRF, QRF, RF, XGB), names_to = "model", values_to = "metrics") %>%
+  pivot_longer(cols = c(DRF, QRF, RF, XGB, ENS), names_to = "model", values_to = "metrics") %>%
   # Expand the tibble stored in list-column
   unnest(metrics)
 
@@ -524,6 +656,7 @@ out_miss_wis <- eval_df %>%
     QRF = wis_one(y, qrf_q05, qrf_q50, qrf_q95),
     RF  = wis_one(y, rf_q05,  rf_q50,  rf_q95),
     XGB = wis_one(y, xgb_q05, xgb_q50, xgb_q95),
+    ENS = wis_one(y, ens_q05, ens_q50, ens_q95),
     .groups = "drop"
   ) %>%
   pivot_longer(-miss_group, names_to = "model", values_to = "WIS")
@@ -541,10 +674,11 @@ out_vent_long <- eval_df %>%
     QRF = list(eval_metrics_vec(qrf_q05, qrf_q95, y)),
     RF  = list(eval_metrics_vec(rf_q05,  rf_q95,  y)),
     XGB = list(eval_metrics_vec(xgb_q05, xgb_q95, y)),
+    ENS = list(eval_metrics_vec(ens_q05, ens_q95, y)),
     
     .groups = "drop"
   ) %>%
-  pivot_longer(cols = c(DRF, QRF, RF, XGB),
+  pivot_longer(cols = c(DRF, QRF, RF, XGB, ENS),
                names_to = "model",
                values_to = "metrics") %>%
   # Expand list-column into separate columns
@@ -559,6 +693,7 @@ out_vent_wis <- eval_df %>%
     QRF = wis_one(y, qrf_q05, qrf_q50, qrf_q95),
     RF  = wis_one(y, rf_q05,  rf_q50,  rf_q95),
     XGB = wis_one(y, xgb_q05, xgb_q50, xgb_q95),
+    ENS = wis_one(y, ens_q05, ens_q50, ens_q95),
     .groups = "drop"
   ) %>%
   pivot_longer(-vent_group, names_to = "model", values_to = "WIS")
@@ -573,6 +708,7 @@ out_vaso_wis <- eval_df %>%
     QRF = wis_one(y, qrf_q05, qrf_q50, qrf_q95),
     RF  = wis_one(y, rf_q05,  rf_q50,  rf_q95),
     XGB = wis_one(y, xgb_q05, xgb_q50, xgb_q95),
+    ENS = wis_one(y, ens_q05, ens_q50, ens_q95),
     .groups = "drop"
   ) %>%
   pivot_longer(-vaso_group, names_to = "model", values_to = "WIS")
@@ -589,7 +725,8 @@ eval_hm <- eval_df %>%
     drf_w = drf_q95 - drf_q05,
     qrf_w = qrf_q95 - qrf_q05,
     rf_w  = rf_q95  - rf_q05,
-    xgb_w = xgb_q95 - xgb_q05
+    xgb_w = xgb_q95 - xgb_q05,
+    ens_w = ens_q95 - ens_q05
   ) %>%
   # Split each model's predictions into high vs low uncertainty 
   # based on interval width (median split)
@@ -597,14 +734,16 @@ eval_hm <- eval_df %>%
     drf_uncert = ifelse(ntile(drf_w, 2) == 2, "High uncertainty", "Low uncertainty"),
     qrf_uncert = ifelse(ntile(qrf_w, 2) == 2, "High uncertainty", "Low uncertainty"),
     rf_uncert  = ifelse(ntile(rf_w,  2) == 2, "High uncertainty", "Low uncertainty"),
-    xgb_uncert = ifelse(ntile(xgb_w, 2) == 2, "High uncertainty", "Low uncertainty")
+    xgb_uncert = ifelse(ntile(xgb_w, 2) == 2, "High uncertainty", "Low uncertainty"),
+    ens_uncert = ifelse(ntile(ens_w, 2) == 2, "High uncertainty", "Low uncertainty")
   )
 
-# calculate the sample siz
+# calculate the sample size, sanity check
 table(eval_hm$drf_uncert)
 table(eval_hm$qrf_uncert)
 table(eval_hm$rf_uncert)
 table(eval_hm$xgb_uncert)
+table(eval_hm$ens_uncert)
 
 # build a function to compute mean WIS on a subset defined by idx
 wis_subset <- function(y, q05, q50, q95, idx) {
@@ -631,7 +770,10 @@ out_uncert_wis <- eval_hm %>%
     RF_high  = wis_subset(y, rf_q05,  rf_q50,  rf_q95,  rf_uncert=="High uncertainty"),
     
     XGB_low  = wis_subset(y, xgb_q05, xgb_q50, xgb_q95, xgb_uncert=="Low uncertainty"),
-    XGB_high = wis_subset(y, xgb_q05, xgb_q50, xgb_q95, xgb_uncert=="High uncertainty")
+    XGB_high = wis_subset(y, xgb_q05, xgb_q50, xgb_q95, xgb_uncert=="High uncertainty"),
+    
+    ENS_low  = wis_subset(y, ens_q05, ens_q50, ens_q95, ens_uncert=="Low uncertainty"),
+    ENS_high = wis_subset(y, ens_q05, ens_q50, ens_q95, ens_uncert=="High uncertainty")
   ) %>%
   pivot_longer(
     everything(),
@@ -643,15 +785,17 @@ out_uncert_wis <- eval_hm %>%
 out_uncert_wis
 # compute the number of each group
 out_uncert_n <- tibble(
-  model = c("DRF","QRF","RF","XGB"),
+  model = c("DRF","QRF","RF","XGB","ENS"),
   low_n  = c(sum(eval_hm$drf_uncert=="Low uncertainty"),
              sum(eval_hm$qrf_uncert=="Low uncertainty"),
              sum(eval_hm$rf_uncert=="Low uncertainty"),
-             sum(eval_hm$xgb_uncert=="Low uncertainty")),
+             sum(eval_hm$xgb_uncert=="Low uncertainty"),
+             sum(eval_hm$ens_uncert=="Low uncertainty")),
   high_n = c(sum(eval_hm$drf_uncert=="High uncertainty"),
              sum(eval_hm$qrf_uncert=="High uncertainty"),
              sum(eval_hm$rf_uncert=="High uncertainty"),
-             sum(eval_hm$xgb_uncert=="High uncertainty"))
+             sum(eval_hm$xgb_uncert=="High uncertainty"),
+             sum(eval_hm$ens_uncert=="High uncertainty"))
 )
 
 out_uncert_n
@@ -703,7 +847,16 @@ out_uncert_cov <- bind_rows(
   
   cov_width_subset(eval_hm$y, eval_hm$xgb_q05, eval_hm$xgb_q95,
                    eval_hm$xgb_uncert == "High uncertainty") %>%
-    mutate(model = "XGB", uncert = "High")
+    mutate(model = "XGB", uncert = "High"),
+  
+  # ENS
+  cov_width_subset(eval_hm$y, eval_hm$ens_q05, eval_hm$ens_q95,
+                   eval_hm$ens_uncert == "Low uncertainty") %>%
+    mutate(model = "ENS", uncert = "Low"),
+  
+  cov_width_subset(eval_hm$y, eval_hm$ens_q05, eval_hm$ens_q95,
+                   eval_hm$ens_uncert == "High uncertainty") %>%
+    mutate(model = "ENS", uncert = "High")
   
 )
 
@@ -784,6 +937,16 @@ cal_df <- bind_rows(
       q05 = xgb_q05,
       q50 = xgb_q50,
       q95 = xgb_q95
+    ),
+  
+  # ENS
+  eval_df %>%
+    transmute(
+      model = "ENS",
+      y,
+      q05 = ens_q05,
+      q50 = ens_q50,
+      q95 = ens_q95
     )
   
 ) %>%
@@ -884,7 +1047,8 @@ crps_all_grid <- c(
   DRF = crps_from_quantiles(eval_df$y, as.matrix(drf_qgrid), q_grid),
   QRF = crps_from_quantiles(eval_df$y, as.matrix(qrf_qgrid), q_grid),
   RF  = crps_from_quantiles(eval_df$y, as.matrix(rf_qgrid),  q_grid),
-  XGB = crps_from_quantiles(eval_df$y, as.matrix(xgb_qgrid), q_grid)
+  XGB = crps_from_quantiles(eval_df$y, as.matrix(xgb_qgrid), q_grid),
+  ENS = crps_from_quantiles(eval_df$y, as.matrix(ens_qgrid), q_grid)
 )
 
 crps_all_grid
@@ -907,34 +1071,39 @@ cover_width_long <- eval_df %>%
     # RF
     rf_q05,  rf_q95,
     # XGB
-    xgb_q05, xgb_q95
+    xgb_q05, xgb_q95,
+    # ENS
+    ens_q05, ens_q95
   ) %>%
   mutate(
     drf_w = drf_q95 - drf_q05,
     qrf_w = qrf_q95 - qrf_q05,
     rf_w  = rf_q95  - rf_q05,
     xgb_w = xgb_q95 - xgb_q05,
+    ens_w = ens_q95 - ens_q05,
     
     drf_cov = as.integer(y >= drf_q05 & y <= drf_q95),
     qrf_cov = as.integer(y >= qrf_q05 & y <= qrf_q95),
     rf_cov  = as.integer(y >= rf_q05  & y <= rf_q95),
-    xgb_cov = as.integer(y >= xgb_q05 & y <= xgb_q95)
+    xgb_cov = as.integer(y >= xgb_q05 & y <= xgb_q95),
+    ens_cov = as.integer(y >= ens_q05 & y <= ens_q95)
   ) %>%
   select(
     y,
     drf_w, drf_cov,
     qrf_w, qrf_cov,
     rf_w,  rf_cov,
-    xgb_w, xgb_cov
+    xgb_w, xgb_cov,
+    ens_w, ens_cov
   ) %>%
   pivot_longer(
     cols = -y,
     names_to = c("model", ".value"),
-    names_pattern = "^(drf|qrf|rf|xgb)_(w|cov)$"
+    names_pattern = "^(drf|qrf|rf|xgb|ens)_(w|cov)$"
   ) %>%
   mutate(
     model = recode(model,
-                   drf = "DRF", qrf = "QRF", rf = "RF", xgb = "XGB")
+                   drf = "DRF", qrf = "QRF", rf = "RF", xgb = "XGB", ens = "ENS")
   ) %>%
   filter(is.finite(w), w >= 0)   # 去掉异常宽度
 
@@ -1002,7 +1171,8 @@ long2d <- eval_df %>%
     drf_q05, drf_q50, drf_q95,
     qrf_q05, qrf_q50, qrf_q95,
     rf_q05,  rf_q50,  rf_q95,
-    xgb_q05, xgb_q50, xgb_q95
+    xgb_q05, xgb_q50, xgb_q95,
+    ens_q05, ens_q50, ens_q95
   ) %>%
   # Compute interval width (uncertainty proxy)
   mutate(
@@ -1010,26 +1180,29 @@ long2d <- eval_df %>%
     qrf_w = qrf_q95 - qrf_q05,
     rf_w  = rf_q95  - rf_q05,
     xgb_w = xgb_q95 - xgb_q05,
+    ens_w = ens_q95 - ens_q05,
     # Compute coverage indicator (1 = covered, 0 = not covered)
     drf_cov = as.integer(y >= drf_q05 & y <= drf_q95),
     qrf_cov = as.integer(y >= qrf_q05 & y <= qrf_q95),
     rf_cov  = as.integer(y >= rf_q05  & y <= rf_q95),
-    xgb_cov = as.integer(y >= xgb_q05 & y <= xgb_q95)
+    xgb_cov = as.integer(y >= xgb_q05 & y <= xgb_q95),
+    ens_cov = as.integer(y >= ens_q05 & y <= ens_q95)
   ) %>%
   select(
     y,
     drf_q50, drf_w, drf_cov,
     qrf_q50, qrf_w, qrf_cov,
     rf_q50,  rf_w,  rf_cov,
-    xgb_q50, xgb_w, xgb_cov
+    xgb_q50, xgb_w, xgb_cov,
+    ens_q50, ens_w, ens_cov
   ) %>%
   pivot_longer(
     cols = -y,
     names_to = c("model", ".value"),
-    names_pattern = "^(drf|qrf|rf|xgb)_(q50|w|cov)$"
+    names_pattern = "^(drf|qrf|rf|xgb|ens)_(q50|w|cov)$"
   ) %>%
   mutate(
-    model = recode(model, drf="DRF", qrf="QRF", rf="RF", xgb="XGB")
+    model = recode(model, drf="DRF", qrf="QRF", rf="RF", xgb="XGB", ens="ENS")
   ) %>%
   filter(is.finite(q50), is.finite(w), w >= 0)
 
