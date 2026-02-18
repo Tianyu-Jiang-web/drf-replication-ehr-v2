@@ -738,7 +738,7 @@ ggplot(out_uncert_cov, aes(x = uncert, y = width, color = model, group = model))
 # Build cal_df for conditional calibration
 # ----------------------------
 
-<- 10  # number of bins
+K<- 10  # number of bins
 
 # ----------------------------
 # Build cal_df safely
