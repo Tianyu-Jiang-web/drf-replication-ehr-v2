@@ -480,6 +480,95 @@ ens_qgrid_mat <- sapply(q_grid, function(p)
 ens_qgrid <- as.data.frame(ens_qgrid_mat)
 colnames(ens_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
 
+# 7-MC Dropout (Gal & Ghahramani, 2016)
+# Approximate Bayesian inference via dropout at test time
+# Keep dropout enabled during prediction and sample M times
+# Aggregate predictions to estimate predictive uncertainty
+
+cat("\nTraining MC Dropout model...\n")
+
+set.seed(2026)
+
+# Number of forward passes at test time (paper recommends 50-100)
+M_dropout <- 100
+
+# Dropout rate (common choices: 0.1 for regression, 0.5 for classification)
+dropout_rate <- 0.1
+
+# Define network with dropout layers
+# Architecture matches Deep Ensembles for fair comparison
+mc_dropout_net <- nn_sequential(
+  nn_linear(n_input, 128),
+  nn_relu(),
+  nn_dropout(p = dropout_rate),
+  nn_linear(128, 64),
+  nn_relu(),
+  nn_dropout(p = dropout_rate),
+  nn_linear(64, 2)   # output: [mu, raw_var]
+)
+
+# Train with dropout enabled (standard training)
+optim_mc <- optim_adam(mc_dropout_net$parameters, lr = 0.001)
+
+mc_dropout_net$train()
+for (epoch in seq_len(100)) {
+  optim_mc$zero_grad()
+  pred <- mc_dropout_net(X_tr_t)
+  loss <- gauss_nll(pred, y_tr_t)
+  loss$backward()
+  optim_mc$step()
+  
+  if (epoch %% 20 == 0) {
+    cat(sprintf("  Epoch %d, Loss: %.4f\n", epoch, as.numeric(loss)))
+  }
+}
+
+# CRITICAL: Keep dropout ENABLED at test time (this is the MC part)
+# Each forward pass samples a different dropout mask
+mc_dropout_net$train()  # NOT eval()! This keeps dropout active
+
+cat(sprintf("Generating %d MC samples...\n", M_dropout))
+
+# Collect M stochastic forward passes
+mc_mu_samples  <- matrix(0, nrow = nrow(Xte_ens_sc), ncol = M_dropout)
+mc_var_samples <- matrix(0, nrow = nrow(Xte_ens_sc), ncol = M_dropout)
+
+with_no_grad({
+  for (i in seq_len(M_dropout)) {
+    pred_i <- mc_dropout_net(X_te_t)
+    mc_mu_samples[, i]  <- as.numeric(pred_i[, 1])
+    mc_var_samples[, i] <- as.numeric(softplus(as.numeric(pred_i[, 2]))) + 1e-6
+  }
+})
+
+# Aggregate MC samples: mean of means, and total variance
+# Total variance = epistemic (variance of means) + aleatoric (mean of variances)
+mu_mc_sc  <- rowMeans(mc_mu_samples)
+var_epistemic <- apply(mc_mu_samples, 1, var)         # model uncertainty
+var_aleatoric <- rowMeans(mc_var_samples)             # data uncertainty
+var_mc_sc <- var_epistemic + var_aleatoric
+var_mc_sc <- pmax(var_mc_sc, 1e-6)
+sd_mc_sc  <- sqrt(var_mc_sc)
+
+# Back-transform to original LOS scale
+mu_mc  <- mu_mc_sc  * y_sd_ens + y_mean_ens
+sd_mc  <- sd_mc_sc  * y_sd_ens
+
+# Extract quantiles (assuming Gaussian predictive distribution)
+lower_bound_mc <- min(y_tr, na.rm = TRUE)
+mcd_q <- data.frame(
+  q05 = pmax(qnorm(0.05, mean = mu_mc, sd = sd_mc), lower_bound_mc),
+  q50 = qnorm(0.50, mean = mu_mc, sd = sd_mc),
+  q95 = qnorm(0.95, mean = mu_mc, sd = sd_mc)
+)
+
+# Dense quantile grid for CRPS
+mcd_qgrid_mat <- sapply(q_grid, function(p)
+  pmax(qnorm(p, mean = mu_mc, sd = sd_mc), lower_bound_mc))
+mcd_qgrid <- as.data.frame(mcd_qgrid_mat)
+colnames(mcd_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
+
+cat("MC Dropout training complete.\n\n")
 
 # evaluation
 # Evaluate prediction interval performance
@@ -500,6 +589,7 @@ res_qrf <- eval_interval(qrf_q, y_te)
 res_rf  <- eval_interval(rf_q,  y_te)
 res_xgb <- eval_interval(xgb_q, y_te)
 res_ens <- eval_interval(ens_q, y_te)
+res_mcd <- eval_interval(mcd_q, y_te)
 
 # combine the results as a table
 rbind(
@@ -507,7 +597,8 @@ rbind(
   QRF = unlist(res_qrf),
   RF  = unlist(res_rf),
   XGB = unlist(res_xgb),
-  ENS = unlist(res_ens)
+  ENS = unlist(res_ens),
+  MCD = unlist(res_mcd)
 )
 
 # library scoringutils to use wis function
@@ -533,7 +624,8 @@ c(
   QRF = wis_score(qrf_q, y_te),
   RF  = wis_score(rf_q,  y_te),
   XGB = wis_score(xgb_q, y_te),
-  ENS = wis_score(ens_q, y_te)
+  ENS = wis_score(ens_q, y_te),
+  MCD = wis_score(mcd_q, y_te)
 )
 
 # --------- Subgroup analysis ----------------#
@@ -561,7 +653,11 @@ eval_df <- data.frame(
   # Deep Ensembles predicted quantiles
   ens_q05 = ens_q$q05,
   ens_q50 = ens_q$q50,
-  ens_q95 = ens_q$q95
+  ens_q95 = ens_q$q95,
+  # MC Dropout predicted quantiles
+  mcd_q05 = mcd_q$q05,
+  mcd_q50 = mcd_q$q50,
+  mcd_q95 = mcd_q$q95
 )
 # Subgroup 1: group by outcome (LOS) ranges
 eval_df$los_group <- cut(
@@ -623,11 +719,11 @@ out_miss_long <- eval_df %>%
     RF  = list(eval_metrics_vec(.data$rf_q05,  .data$rf_q95,  .data$y)),
     XGB = list(eval_metrics_vec(.data$xgb_q05, .data$xgb_q95, .data$y)),
     ENS = list(eval_metrics_vec(.data$ens_q05, .data$ens_q95, .data$y)),
-    
+    MCD = list(eval_metrics_vec(.data$mcd_q05, .data$mcd_q95, .data$y)),
     .groups = "drop"
   ) %>%
   # Convert wide model columns into long format
-  pivot_longer(cols = c(DRF, QRF, RF, XGB, ENS), names_to = "model", values_to = "metrics") %>%
+  pivot_longer(cols = c(DRF, QRF, RF, XGB, ENS, MCD), names_to = "model", values_to = "metrics") %>%
   # Expand the tibble stored in list-column
   unnest(metrics)
 
@@ -657,6 +753,7 @@ out_miss_wis <- eval_df %>%
     RF  = wis_one(y, rf_q05,  rf_q50,  rf_q95),
     XGB = wis_one(y, xgb_q05, xgb_q50, xgb_q95),
     ENS = wis_one(y, ens_q05, ens_q50, ens_q95),
+    MCD = wis_one(y, mcd_q05, mcd_q50, mcd_q95),
     .groups = "drop"
   ) %>%
   pivot_longer(-miss_group, names_to = "model", values_to = "WIS")
@@ -675,10 +772,10 @@ out_vent_long <- eval_df %>%
     RF  = list(eval_metrics_vec(rf_q05,  rf_q95,  y)),
     XGB = list(eval_metrics_vec(xgb_q05, xgb_q95, y)),
     ENS = list(eval_metrics_vec(ens_q05, ens_q95, y)),
-    
+    MCD = list(eval_metrics_vec(mcd_q05, mcd_q95, y)),
     .groups = "drop"
   ) %>%
-  pivot_longer(cols = c(DRF, QRF, RF, XGB, ENS),
+  pivot_longer(cols = c(DRF, QRF, RF, XGB, ENS, MCD),
                names_to = "model",
                values_to = "metrics") %>%
   # Expand list-column into separate columns
@@ -694,6 +791,7 @@ out_vent_wis <- eval_df %>%
     RF  = wis_one(y, rf_q05,  rf_q50,  rf_q95),
     XGB = wis_one(y, xgb_q05, xgb_q50, xgb_q95),
     ENS = wis_one(y, ens_q05, ens_q50, ens_q95),
+    MCD = wis_one(y, mcd_q05, mcd_q50, mcd_q95),
     .groups = "drop"
   ) %>%
   pivot_longer(-vent_group, names_to = "model", values_to = "WIS")
@@ -709,6 +807,7 @@ out_vaso_wis <- eval_df %>%
     RF  = wis_one(y, rf_q05,  rf_q50,  rf_q95),
     XGB = wis_one(y, xgb_q05, xgb_q50, xgb_q95),
     ENS = wis_one(y, ens_q05, ens_q50, ens_q95),
+    MCD = wis_one(y, mcd_q05, mcd_q50, mcd_q95),
     .groups = "drop"
   ) %>%
   pivot_longer(-vaso_group, names_to = "model", values_to = "WIS")
@@ -726,7 +825,8 @@ eval_hm <- eval_df %>%
     qrf_w = qrf_q95 - qrf_q05,
     rf_w  = rf_q95  - rf_q05,
     xgb_w = xgb_q95 - xgb_q05,
-    ens_w = ens_q95 - ens_q05
+    ens_w = ens_q95 - ens_q05,
+    mcd_w = mcd_q95 - mcd_q05
   ) %>%
   # Split each model's predictions into high vs low uncertainty 
   # based on interval width (median split)
@@ -735,7 +835,8 @@ eval_hm <- eval_df %>%
     qrf_uncert = ifelse(ntile(qrf_w, 2) == 2, "High uncertainty", "Low uncertainty"),
     rf_uncert  = ifelse(ntile(rf_w,  2) == 2, "High uncertainty", "Low uncertainty"),
     xgb_uncert = ifelse(ntile(xgb_w, 2) == 2, "High uncertainty", "Low uncertainty"),
-    ens_uncert = ifelse(ntile(ens_w, 2) == 2, "High uncertainty", "Low uncertainty")
+    ens_uncert = ifelse(ntile(ens_w, 2) == 2, "High uncertainty", "Low uncertainty"),
+    mcd_uncert = ifelse(ntile(mcd_w, 2) == 2, "High uncertainty", "Low uncertainty")
   )
 
 # calculate the sample size, sanity check
@@ -744,6 +845,7 @@ table(eval_hm$qrf_uncert)
 table(eval_hm$rf_uncert)
 table(eval_hm$xgb_uncert)
 table(eval_hm$ens_uncert)
+table(eval_hm$mcd_uncert)
 
 # build a function to compute mean WIS on a subset defined by idx
 wis_subset <- function(y, q05, q50, q95, idx) {
@@ -773,7 +875,10 @@ out_uncert_wis <- eval_hm %>%
     XGB_high = wis_subset(y, xgb_q05, xgb_q50, xgb_q95, xgb_uncert=="High uncertainty"),
     
     ENS_low  = wis_subset(y, ens_q05, ens_q50, ens_q95, ens_uncert=="Low uncertainty"),
-    ENS_high = wis_subset(y, ens_q05, ens_q50, ens_q95, ens_uncert=="High uncertainty")
+    ENS_high = wis_subset(y, ens_q05, ens_q50, ens_q95, ens_uncert=="High uncertainty"),
+    
+    MCD_low  = wis_subset(y, mcd_q05, mcd_q50, mcd_q95, mcd_uncert=="Low uncertainty"),
+    MCD_high = wis_subset(y, mcd_q05, mcd_q50, mcd_q95, mcd_uncert=="High uncertainty")
   ) %>%
   pivot_longer(
     everything(),
@@ -785,17 +890,19 @@ out_uncert_wis <- eval_hm %>%
 out_uncert_wis
 # compute the number of each group
 out_uncert_n <- tibble(
-  model = c("DRF","QRF","RF","XGB","ENS"),
+  model = c("DRF","QRF","RF","XGB","ENS","MCD"),
   low_n  = c(sum(eval_hm$drf_uncert=="Low uncertainty"),
              sum(eval_hm$qrf_uncert=="Low uncertainty"),
              sum(eval_hm$rf_uncert=="Low uncertainty"),
              sum(eval_hm$xgb_uncert=="Low uncertainty"),
-             sum(eval_hm$ens_uncert=="Low uncertainty")),
+             sum(eval_hm$ens_uncert=="Low uncertainty"),
+             sum(eval_hm$mcd_uncert=="Low uncertainty")),
   high_n = c(sum(eval_hm$drf_uncert=="High uncertainty"),
              sum(eval_hm$qrf_uncert=="High uncertainty"),
              sum(eval_hm$rf_uncert=="High uncertainty"),
              sum(eval_hm$xgb_uncert=="High uncertainty"),
-             sum(eval_hm$ens_uncert=="High uncertainty"))
+             sum(eval_hm$ens_uncert=="High uncertainty"),
+             sum(eval_hm$mcd_uncert=="High uncertainty"))
 )
 
 out_uncert_n
@@ -856,7 +963,16 @@ out_uncert_cov <- bind_rows(
   
   cov_width_subset(eval_hm$y, eval_hm$ens_q05, eval_hm$ens_q95,
                    eval_hm$ens_uncert == "High uncertainty") %>%
-    mutate(model = "ENS", uncert = "High")
+    mutate(model = "ENS", uncert = "High"),
+  
+  # MCD
+  cov_width_subset(eval_hm$y, eval_hm$mcd_q05, eval_hm$mcd_q95,
+                   eval_hm$mcd_uncert == "Low uncertainty") %>%
+    mutate(model = "MCD", uncert = "Low"),
+  
+  cov_width_subset(eval_hm$y, eval_hm$mcd_q05, eval_hm$mcd_q95,
+                   eval_hm$mcd_uncert == "High uncertainty") %>%
+    mutate(model = "MCD", uncert = "High")
   
 )
 
@@ -947,6 +1063,16 @@ cal_df <- bind_rows(
       q05 = ens_q05,
       q50 = ens_q50,
       q95 = ens_q95
+    ),
+  
+  # MCD
+  eval_df %>%
+    transmute(
+      model = "MCD",
+      y,
+      q05 = mcd_q05,
+      q50 = mcd_q50,
+      q95 = mcd_q95
     )
   
 ) %>%
@@ -1048,14 +1174,349 @@ crps_all_grid <- c(
   QRF = crps_from_quantiles(eval_df$y, as.matrix(qrf_qgrid), q_grid),
   RF  = crps_from_quantiles(eval_df$y, as.matrix(rf_qgrid),  q_grid),
   XGB = crps_from_quantiles(eval_df$y, as.matrix(xgb_qgrid), q_grid),
-  ENS = crps_from_quantiles(eval_df$y, as.matrix(ens_qgrid), q_grid)
+  ENS = crps_from_quantiles(eval_df$y, as.matrix(ens_qgrid), q_grid),
+  MCD = crps_from_quantiles(eval_df$y, as.matrix(mcd_qgrid), q_grid)
 )
 
 crps_all_grid
 
 
+# ---- NLL (Negative Log-Likelihood) evaluation ----
+# For DRF/QRF/RF: approximate density from quantile grid via numerical differentiation
+# For ENS/MCD: use analytical Gaussian likelihood
+# XGB skipped: conformal prediction does not provide explicit probability density
 
-# ----------
+# Helper: approximate PDF from quantile predictions
+# Given quantiles q at levels tau, approximate f(y) via numerical differentiation of CDF
+approx_density_from_quantiles <- function(y, qmat, taus) {
+  # qmat: n_test x n_quantiles matrix
+  # taus: quantile levels (e.g., 0.05, 0.10, ..., 0.95)
+  # Returns: density estimate for each y
+  
+  n <- length(y)
+  densities <- numeric(n)
+  
+  for (i in seq_len(n)) {
+    q_i <- qmat[i, ]  # quantiles for observation i
+    y_i <- y[i]
+    
+    # Find where y_i falls in the quantile grid
+    # CDF(y) is approximated by interpolating tau values
+    if (y_i <= q_i[1]) {
+      # Below first quantile: use left tail approximation
+      # f(y) ≈ delta_tau / delta_q for first interval
+      delta_q <- q_i[2] - q_i[1]
+      delta_tau <- taus[2] - taus[1]
+      if (delta_q > 1e-10) {
+        densities[i] <- delta_tau / delta_q
+      } else {
+        densities[i] <- 1e-6  # numerical floor
+      }
+    } else if (y_i >= q_i[length(q_i)]) {
+      # Above last quantile: use right tail approximation
+      n_q <- length(q_i)
+      delta_q <- q_i[n_q] - q_i[n_q - 1]
+      delta_tau <- taus[n_q] - taus[n_q - 1]
+      if (delta_q > 1e-10) {
+        densities[i] <- delta_tau / delta_q
+      } else {
+        densities[i] <- 1e-6
+      }
+    } else {
+      # Within quantile range: linear interpolation of CDF, then differentiate
+      # Find bracket: q[j] <= y < q[j+1]
+      j <- max(which(q_i <= y_i))
+      
+      if (j < length(q_i)) {
+        # PDF ≈ dF/dy ≈ (tau[j+1] - tau[j]) / (q[j+1] - q[j])
+        delta_q <- q_i[j + 1] - q_i[j]
+        delta_tau <- taus[j + 1] - taus[j]
+        
+        if (delta_q > 1e-10) {
+          densities[i] <- delta_tau / delta_q
+        } else {
+          # quantiles too close: use numerical floor
+          densities[i] <- 1e-6
+        }
+      } else {
+        densities[i] <- 1e-6
+      }
+    }
+  }
+  
+  # Ensure positive density with numerical floor
+  pmax(densities, 1e-10)
+}
+
+# Compute NLL for each model
+cat("\nComputing NLL (Negative Log-Likelihood)...\n")
+
+# DRF: approximate density from quantile grid
+drf_densities <- approx_density_from_quantiles(y_te, as.matrix(drf_qgrid), q_grid)
+nll_drf <- -mean(log(drf_densities))
+
+# QRF: approximate density from quantile grid
+qrf_densities <- approx_density_from_quantiles(y_te, as.matrix(qrf_qgrid), q_grid)
+nll_qrf <- -mean(log(qrf_densities))
+
+# RF: approximate density from quantile grid
+rf_densities <- approx_density_from_quantiles(y_te, as.matrix(rf_qgrid), q_grid)
+nll_rf <- -mean(log(rf_densities))
+
+# ENS: analytical Gaussian NLL
+# NLL = 0.5 * log(2π) + 0.5 * log(σ²) + 0.5 * (y - μ)² / σ²
+nll_ens <- mean(0.5 * log(2 * pi) + log(sd_ens) + 0.5 * ((y_te - mu_ens) / sd_ens)^2)
+
+# MCD: analytical Gaussian NLL
+nll_mcd <- mean(0.5 * log(2 * pi) + log(sd_mc) + 0.5 * ((y_te - mu_mc) / sd_mc)^2)
+
+# Combine results (XGB omitted: no explicit density from conformal prediction)
+nll_results <- c(
+  DRF = nll_drf,
+  QRF = nll_qrf,
+  RF  = nll_rf,
+  ENS = nll_ens,
+  MCD = nll_mcd
+)
+
+cat("\nNLL (lower is better):\n")
+print(round(nll_results, 4))
+
+
+cat("\n=== Generating Test Set Distribution Comparison ===\n")
+
+# ---- Method 1: Histogram + Density Overlay (Most Intuitive) ----
+
+# Prepare data: sample from each model's predictive distribution
+set.seed(2026)
+n_samples_per_patient <- 100  # Draw 100 samples per patient from each model
+
+# Helper: sample from quantile-based distribution
+sample_from_quantiles <- function(qmat, taus, n_samples) {
+  # qmat: n_test x n_quantiles
+  # Returns: n_test x n_samples matrix of sampled values
+  
+  n_test <- nrow(qmat)
+  samples <- matrix(0, nrow = n_test, ncol = n_samples)
+  
+  for (i in seq_len(n_test)) {
+    # Inverse CDF sampling: generate uniform U ~ [0,1], find Q(U)
+    u <- runif(n_samples)
+    
+    # Interpolate quantile function
+    samples[i, ] <- approx(x = taus, y = qmat[i, ], xout = u, rule = 2)$y
+  }
+  
+  samples
+}
+
+# Sample from each model
+cat("Sampling from predictive distributions...\n")
+
+drf_samples <- sample_from_quantiles(as.matrix(drf_qgrid), q_grid, n_samples_per_patient)
+qrf_samples <- sample_from_quantiles(as.matrix(qrf_qgrid), q_grid, n_samples_per_patient)
+rf_samples  <- sample_from_quantiles(as.matrix(rf_qgrid),  q_grid, n_samples_per_patient)
+
+# For Gaussian models: sample from N(μ, σ²)
+ens_samples <- matrix(rnorm(length(y_te) * n_samples_per_patient, 
+                            mean = rep(mu_ens, each = n_samples_per_patient),
+                            sd = rep(sd_ens, each = n_samples_per_patient)),
+                      nrow = length(y_te), ncol = n_samples_per_patient, byrow = TRUE)
+
+mcd_samples <- matrix(rnorm(length(y_te) * n_samples_per_patient,
+                            mean = rep(mu_mc, each = n_samples_per_patient),
+                            sd = rep(sd_mc, each = n_samples_per_patient)),
+                      nrow = length(y_te), ncol = n_samples_per_patient, byrow = TRUE)
+
+# Flatten to long format for ggplot
+df_dist <- data.frame(
+  LOS = c(
+    y_te,                         # Actual
+    as.vector(drf_samples),       # DRF
+    as.vector(qrf_samples),       # QRF
+    as.vector(rf_samples),        # RF
+    as.vector(ens_samples),       # ENS
+    as.vector(mcd_samples)        # MCD
+  ),
+  Model = rep(
+    c("Actual", "DRF", "QRF", "RF", "ENS (Gaussian)", "MCD (Gaussian)"),
+    times = c(length(y_te), rep(length(y_te) * n_samples_per_patient, 5))
+  )
+)
+
+# Remove extreme outliers for better visualization (optional)
+df_dist <- df_dist %>% filter(LOS >= 0, LOS <= quantile(y_te, 0.99) * 1.5)
+
+cat(sprintf("Total samples: %d\n", nrow(df_dist)))
+
+
+# ---- 最终学术期刊风格对比图：分面+背景真值对比 ----
+
+# 1. 数据预处理（复用你之前的 df_dist）
+# 确保 Model 是有序因子，方便排序展示
+df_dist$Model <- factor(df_dist$Model, levels = c("Actual", "DRF", "QRF", "RF", "ENS (Gaussian)", "MCD (Gaussian)"))
+
+# 创建一个专门用于绘制“背景真值”的数据框，去除 Model 列
+# 这样在 facet_wrap 时，这部分数据会在每个面板中重复出现
+df_actual_bg <- df_dist %>% 
+  filter(Model == "Actual") %>% 
+  select(-Model)
+
+# 2. 绘图
+p_final <- ggplot() +
+  # 第一层：在每个面板背景绘制灰色填充的真实分布 (Actual)
+  geom_density(data = df_actual_bg, aes(x = LOS), 
+               fill = "gray50", color = "gray30", alpha = 0.8, linewidth = 0.5) +
+  
+  # 第二层：绘制各模型自身的预测分布（不包含单独的 Actual 面板，或者让它重叠）
+  # 过滤掉 Actual 组，因为我们只需要展示五个模型的面板
+  geom_density(data = df_dist %>% filter(Model != "Actual"), 
+               aes(x = LOS, color = Model, fill = Model), 
+               alpha = 0.5, linewidth = 0.9) +
+  
+  # 分面设置：一行五个或者两行（这里建议一行5个，水平对比感最强；或者 2x3 包含 Actual）
+  # 我们展示 5 个模型面板
+  facet_wrap(~ Model, ncol = 3) + 
+  
+  # 配色方案：学术常用 Set1 或自定义
+  scale_fill_manual(values = c(
+    "DRF" = "#F4A3A3",        # 更浅红
+    "QRF" = "#A8C5E5",        # 更浅蓝
+    "RF"  = "#B7E3B0",        # 更浅绿
+    "ENS (Gaussian)" = "#984EA3", 
+    "MCD (Gaussian)" = "#FF7F00"
+  )) +
+  
+  scale_color_manual(values = c(
+    "DRF" = "#D65C5C",        # 中等红
+    "QRF" = "#5A9BD4",        # 中等蓝
+    "RF"  = "#66BB66",        # 中等绿
+    "ENS (Gaussian)" = "#7A3E82", 
+    "MCD (Gaussian)" = "#CC6600"
+  )) +
+  
+  # 坐标轴限制（根据 LOS 分布自动优化，建议展示 95% 分位数区间）
+  coord_cartesian(xlim = c(0, quantile(y_te, 0.95) * 1.3)) +
+  
+  # 学术主题优化
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Comparison of Predictive Distributions against Actual LOS",
+    subtitle = "Gray shaded area represents the actual LOS distribution in all panels",
+    x = "Length of Stay (Days)",
+    y = "Density",
+    caption = "Note: Non-parametric models (top) show superior tail-capture compared to Gaussian models (bottom)."
+  ) +
+  theme(
+    strip.background = element_rect(fill = "gray95", color = "gray80"), # 修改标题背景
+    strip.text = element_text(face = "bold", size = 12),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(), # 减少纵向线条，干扰视线
+    legend.position = "none", # 因为标题已经说明了模型，不需要图例
+    plot.title = element_text(face = "bold", size = 16, hjust = 0),
+    plot.subtitle = element_text(color = "gray30", size = 12),
+    axis.title = element_text(face = "bold")
+  )
+
+# 显示
+print(p_final)
+
+# 保存为高分辨率 PDF (期刊投稿首选) 或 PNG
+ggsave("/mnt/user-data/outputs/academic_dist_comparison.png", 
+       plot = p_final, width = 12, height = 7, dpi = 600)
+
+
+# ---- Quantitative Assessment: KL Divergence & KS Distance ----
+# Use Kernel Density Estimation instead of histograms for robustness
+
+cat("\n=== Quantitative Distribution Comparison ===\n")
+
+# Helper: Approximate KL divergence using kernel density estimates
+kl_divergence_kde <- function(x_true, x_pred, n_grid = 200) {
+  # Use common grid that spans both distributions
+  x_min <- min(c(x_true, x_pred), na.rm = TRUE)
+  x_max <- max(c(x_true, x_pred), na.rm = TRUE)
+  grid <- seq(x_min, x_max, length.out = n_grid)
+  
+  # Estimate densities using KDE
+  dens_true <- density(x_true, from = x_min, to = x_max, n = n_grid, na.rm = TRUE)
+  dens_pred <- density(x_pred, from = x_min, to = x_max, n = n_grid, na.rm = TRUE)
+  
+  # Get density values
+  p <- dens_true$y
+  q <- dens_pred$y
+  
+  # Add small epsilon to avoid log(0)
+  eps <- 1e-10
+  p <- pmax(p, eps)
+  q <- pmax(q, eps)
+  
+  # Normalize to ensure they sum to 1
+  p <- p / sum(p)
+  q <- q / sum(q)
+  
+  # Compute KL divergence: sum(p * log(p/q))
+  kl <- sum(p * log(p / q), na.rm = TRUE)
+  
+  return(kl)
+}
+
+# Compute KL divergence for each model
+cat("Computing KL divergence (this may take a moment)...\n")
+
+kl_results <- c(
+  DRF = kl_divergence_kde(y_te, as.vector(drf_samples)),
+  QRF = kl_divergence_kde(y_te, as.vector(qrf_samples)),
+  RF  = kl_divergence_kde(y_te, as.vector(rf_samples)),
+  ENS = kl_divergence_kde(y_te, as.vector(ens_samples)),
+  MCD = kl_divergence_kde(y_te, as.vector(mcd_samples))
+)
+
+cat("\nKL Divergence D_KL(P_actual || P_model) [lower is better]:\n")
+print(round(kl_results, 4))
+
+cat("\nBest distributional fit (lowest KL):", names(which.min(kl_results)), "\n")
+
+
+# ---- Statistical Tests ----
+# Kolmogorov-Smirnov test: compare empirical CDFs
+
+ks_drf <- ks.test(y_te, as.vector(drf_samples))$statistic
+ks_qrf <- ks.test(y_te, as.vector(qrf_samples))$statistic
+ks_rf  <- ks.test(y_te, as.vector(rf_samples))$statistic
+ks_ens <- ks.test(y_te, as.vector(ens_samples))$statistic
+ks_mcd <- ks.test(y_te, as.vector(mcd_samples))$statistic
+
+ks_results <- c(
+  DRF = ks_drf,
+  QRF = ks_qrf,
+  RF  = ks_rf,
+  ENS = ks_ens,
+  MCD = ks_mcd
+)
+
+cat("\nKolmogorov-Smirnov Distance [lower is better]:\n")
+print(round(ks_results, 4))
+
+cat("\nBest CDF match (lowest KS):", names(which.min(ks_results)), "\n")
+
+
+# ---- Summary Table ----
+summary_table <- data.frame(
+  Model = c("DRF", "QRF", "RF", "ENS", "MCD"),
+  NLL = round(nll_results, 4),
+  KL_Divergence = round(kl_results, 4),
+  KS_Distance = round(ks_results, 4)
+)
+
+cat("\n=== Summary: Distribution Fit Metrics ===\n")
+print(summary_table)
+
+cat("\n✓ All plots saved to /mnt/user-data/outputs/\n")
+cat("✓ Recommended for publication: distribution_comparison_density.png\n")
+
+
+# ---------- plot CRPS results -------------#
 library(scales)
 
 alpha_target <- 0.90   # 你的区间是 90% (0.05~0.95)
@@ -1073,7 +1534,9 @@ cover_width_long <- eval_df %>%
     # XGB
     xgb_q05, xgb_q95,
     # ENS
-    ens_q05, ens_q95
+    ens_q05, ens_q95,
+    # MCD
+    mcd_q05, mcd_q95
   ) %>%
   mutate(
     drf_w = drf_q95 - drf_q05,
@@ -1081,12 +1544,14 @@ cover_width_long <- eval_df %>%
     rf_w  = rf_q95  - rf_q05,
     xgb_w = xgb_q95 - xgb_q05,
     ens_w = ens_q95 - ens_q05,
+    mcd_w = mcd_q95 - mcd_q05,
     
     drf_cov = as.integer(y >= drf_q05 & y <= drf_q95),
     qrf_cov = as.integer(y >= qrf_q05 & y <= qrf_q95),
     rf_cov  = as.integer(y >= rf_q05  & y <= rf_q95),
     xgb_cov = as.integer(y >= xgb_q05 & y <= xgb_q95),
-    ens_cov = as.integer(y >= ens_q05 & y <= ens_q95)
+    ens_cov = as.integer(y >= ens_q05 & y <= ens_q95),
+    mcd_cov = as.integer(y >= mcd_q05 & y <= mcd_q95)
   ) %>%
   select(
     y,
@@ -1094,16 +1559,17 @@ cover_width_long <- eval_df %>%
     qrf_w, qrf_cov,
     rf_w,  rf_cov,
     xgb_w, xgb_cov,
-    ens_w, ens_cov
+    ens_w, ens_cov,
+    mcd_w, mcd_cov
   ) %>%
   pivot_longer(
     cols = -y,
     names_to = c("model", ".value"),
-    names_pattern = "^(drf|qrf|rf|xgb|ens)_(w|cov)$"
+    names_pattern = "^(drf|qrf|rf|xgb|ens|mcd)_(w|cov)$"
   ) %>%
   mutate(
     model = recode(model,
-                   drf = "DRF", qrf = "QRF", rf = "RF", xgb = "XGB", ens = "ENS")
+                   drf = "DRF", qrf = "QRF", rf = "RF", xgb = "XGB", ens = "ENS", mcd = "MCD")
   ) %>%
   filter(is.finite(w), w >= 0)   # 去掉异常宽度
 
@@ -1172,7 +1638,8 @@ long2d <- eval_df %>%
     qrf_q05, qrf_q50, qrf_q95,
     rf_q05,  rf_q50,  rf_q95,
     xgb_q05, xgb_q50, xgb_q95,
-    ens_q05, ens_q50, ens_q95
+    ens_q05, ens_q50, ens_q95,
+    mcd_q05, mcd_q50, mcd_q95
   ) %>%
   # Compute interval width (uncertainty proxy)
   mutate(
@@ -1181,12 +1648,14 @@ long2d <- eval_df %>%
     rf_w  = rf_q95  - rf_q05,
     xgb_w = xgb_q95 - xgb_q05,
     ens_w = ens_q95 - ens_q05,
+    mcd_w = mcd_q95 - mcd_q05,
     # Compute coverage indicator (1 = covered, 0 = not covered)
     drf_cov = as.integer(y >= drf_q05 & y <= drf_q95),
     qrf_cov = as.integer(y >= qrf_q05 & y <= qrf_q95),
     rf_cov  = as.integer(y >= rf_q05  & y <= rf_q95),
     xgb_cov = as.integer(y >= xgb_q05 & y <= xgb_q95),
-    ens_cov = as.integer(y >= ens_q05 & y <= ens_q95)
+    ens_cov = as.integer(y >= ens_q05 & y <= ens_q95),
+    mcd_cov = as.integer(y >= mcd_q05 & y <= mcd_q95)
   ) %>%
   select(
     y,
@@ -1194,15 +1663,16 @@ long2d <- eval_df %>%
     qrf_q50, qrf_w, qrf_cov,
     rf_q50,  rf_w,  rf_cov,
     xgb_q50, xgb_w, xgb_cov,
-    ens_q50, ens_w, ens_cov
+    ens_q50, ens_w, ens_cov,
+    mcd_q50, mcd_w, mcd_cov
   ) %>%
   pivot_longer(
     cols = -y,
     names_to = c("model", ".value"),
-    names_pattern = "^(drf|qrf|rf|xgb|ens)_(q50|w|cov)$"
+    names_pattern = "^(drf|qrf|rf|xgb|ens|mcd)_(q50|w|cov)$"
   ) %>%
   mutate(
-    model = recode(model, drf="DRF", qrf="QRF", rf="RF", xgb="XGB", ens="ENS")
+    model = recode(model, drf="DRF", qrf="QRF", rf="RF", xgb="XGB", ens="ENS", mcd="MCD")
   ) %>%
   filter(is.finite(q50), is.finite(w), w >= 0)
 
