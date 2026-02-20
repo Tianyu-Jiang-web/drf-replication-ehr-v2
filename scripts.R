@@ -101,7 +101,7 @@ df2 <- df2 %>%
   left_join(df_time, by = c("subject_id","hadm_id"))
 
 # Remove ID variables and their missingness indicators
-df2 <- df2 %>% select(-subject_id, -hadm_id, -subject_id_miss, -hadm_id_miss)
+df2 <- df2 %>% select(-subject_id, -hadm_id, -subject_id_miss, -hadm_id_first_miss)
 
 # create a new dataframe with median imputation applied on its numeric variables
 df_imp <- df2
