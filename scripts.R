@@ -1,7 +1,7 @@
 library(dplyr)
 library(readr)
 library(lubridate)
-
+library(tidyr)
 # read the dataset
 df <- read.csv("data/FINAL_master_dataset_9Feb2026(in).csv") %>%
   filter(!is.na(icu_los_days))
@@ -84,12 +84,13 @@ df2 <- df2 %>% mutate(across(all_of(cat_cols), ~as.factor(trimws(.x))))
 # select all numeric variables except for los
 num_cols <- names(df2)[sapply(df2, is.numeric)]
 num_cols <- setdiff(num_cols, "y")
-# Create a new column named original_variable + "_miss"
-# Assign 1 if missing, 0 otherwise
-for (v in num_cols) {
-  df2[[paste0(v, "_miss")]] <- as.integer(is.na(df2[[v]]))
-}
 
+# ----------------------------------
+# Create global missingness feature
+# ----------------------------------
+
+# proportion of missing values per row
+df2$global_missing_rate <- rowMeans(is.na(df2))
 # prepare a imputed dataset for QRF
 # extract and parse admission time from the original dataframe
 df_time <- df %>%
@@ -101,7 +102,7 @@ df2 <- df2 %>%
   left_join(df_time, by = c("subject_id","hadm_id"))
 
 # Remove ID variables and their missingness indicators
-df2 <- df2 %>% select(-subject_id, -hadm_id, -subject_id_miss, -hadm_id_first_miss)
+df2 <- df2 %>% select(-subject_id, ,- hadm_id, -hadm_id_first)
 
 # create a new dataframe with median imputation applied on its numeric variables
 df_imp <- df2
@@ -187,7 +188,7 @@ drf_pred <- predict(drf_fit, Xte_tree)
 library(Matrix)
 
 # set a range of quantiles level
-q_grid <- seq(0.05, 0.95, by = 0.05)   # 19个分位数
+q_grid <- seq(0.05, 0.95, by = 0.05)
 
 # get weight from the outcome
 W <- drf_pred$weights  # n_test x n_train, dgCMatrix
@@ -979,6 +980,7 @@ out_uncert_cov <- bind_rows(
 out_uncert_cov
 
 # draw the plot for the results
+library(ggplot2)
 ggplot(out_uncert_cov, aes(x = uncert, y = coverage, color = model, group = model)) +
   geom_line(linewidth = 0.9) +
   geom_point(size = 2) +
