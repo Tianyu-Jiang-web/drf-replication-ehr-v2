@@ -217,12 +217,13 @@ drf_q <- as.data.frame(drf_q_mat)
 colnames(drf_q) <- c("q05","q50","q95")
 
 # ---- DRF quantile grid predictions (NEW) ----
+# Prediction for each quantile
 drf_qgrid_mat <- t(sapply(1:nrow(W), function(i) {
   w <- as.numeric(W[i, ])
   wquant(y_train, w, q_grid)
 }))
 
-# transfer drf_q_mat as dataframe
+# transfer drf_qgrid as dataframe
 drf_qgrid <- as.data.frame(drf_qgrid_mat)
 colnames(drf_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
 
@@ -247,6 +248,7 @@ qrf_q <- as.data.frame(
 colnames(qrf_q) <- c("q05","q50","q95")
 
 # ---- QRF quantile grid predictions (NEW) ----
+# predict los for each quantile
 qrf_qgrid <- as.data.frame(predict(qrf_fit, Xte_all, what = q_grid))
 colnames(qrf_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
 
@@ -272,6 +274,7 @@ rf_q <- as.data.frame(
 colnames(rf_q) <- c("q05","q50","q95")
 
 # ---- Ranger quantile grid predictions (NEW) ----
+# predict los for each quantiles
 rf_qgrid <- as.data.frame(
   predict(rf_q_fit, Xte_all, type = "quantiles", quantiles = q_grid)$predictions
 )
@@ -410,12 +413,11 @@ make_prob_net <- function(n_in) {
   )
 }
 
-# Gaussian NLL loss (proper scoring rule, Eq.1 in paper)
+# Gaussian NLL loss (proper scoring rule)
 gauss_nll <- function(pred, y_true) {
   mu      <- pred[, 1, drop = FALSE]
   log_var <- pred[, 2, drop = FALSE]
-  # softplus to ensure variance > 0, add small epsilon for stability
-  var     <- torch_log1p(torch_exp(log_var)) + 1e-6
+  var     <- torch_exp(log_var) + 1e-6
   loss    <- torch_mean(log_var + (y_true - mu)^2 / var)
   loss
 }
@@ -508,14 +510,19 @@ mc_dropout_net <- nn_sequential(
   nn_linear(64, 2)   # output: [mu, raw_var]
 )
 
-# Train with dropout enabled (standard training)
+# Set opitimizer
 optim_mc <- optim_adam(mc_dropout_net$parameters, lr = 0.001)
 
+# Start training
 mc_dropout_net$train()
 for (epoch in seq_len(100)) {
+  # Reset gradients from previous iteration
   optim_mc$zero_grad()
+  # Forward pass: compute model predictions
   pred <- mc_dropout_net(X_tr_t)
+  # Compute Gaussian NLL loss
   loss <- gauss_nll(pred, y_tr_t)
+  # Backpropagate gradients
   loss$backward()
   optim_mc$step()
   
