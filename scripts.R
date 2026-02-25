@@ -362,9 +362,9 @@ xgb_qgrid <- as.data.frame(xgb_qgrid_mat)
 colnames(xgb_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
 
 # 6-Deep Ensembles (Lakshminarayanan et al., NIPS 2017)
-# Each network outputs mean mu(x) and variance sigma^2(x)
-# Trained with Gaussian NLL as the proper scoring rule
-# Ensemble prediction: mixture of Gaussians -> quantiles via qnorm
+# Non-parametric extension: Quantile Regression Neural Networks
+# Each network outputs multiple quantiles directly (no distributional assumption)
+# Ensemble prediction: average quantiles across networks
 
 library(torch)
 
@@ -395,188 +395,212 @@ y_sd_ens   <- sd(y_tr)
 y_tr_sc    <- (y_tr - y_mean_ens) / y_sd_ens
 
 n_input <- ncol(Xtr_ens_sc)
+n_quantiles <- length(q_grid)
 
 # Convert to torch tensors
 X_tr_t <- torch_tensor(Xtr_ens_sc, dtype = torch_float())
 y_tr_t <- torch_tensor(matrix(y_tr_sc, ncol = 1), dtype = torch_float())
 X_te_t <- torch_tensor(Xte_ens_sc, dtype = torch_float())
 
-# Define a single probabilistic NN: outputs (mu, log_var)
-# Architecture: input -> 128 -> 64 -> 2  (with ReLU activations)
-make_prob_net <- function(n_in) {
+# Quantile levels as tensor
+tau_t <- torch_tensor(matrix(q_grid, nrow = 1), dtype = torch_float())
+
+
+# Define Quantile Regression NN
+make_qrnn <- function(n_in, n_out) {
   nn_sequential(
     nn_linear(n_in, 128),
     nn_relu(),
     nn_linear(128, 64),
     nn_relu(),
-    nn_linear(64, 2)   # output: [mu, raw_var (pre-softplus)]
+    nn_linear(64, n_out)   # output: one value per quantile
   )
 }
 
-# Gaussian NLL loss (proper scoring rule)
-gauss_nll <- function(pred, y_true) {
-  mu      <- pred[, 1, drop = FALSE]
-  log_var <- pred[, 2, drop = FALSE]
-  var     <- torch_exp(log_var) + 1e-6
-  loss    <- torch_mean(log_var + (y_true - mu)^2 / var)
-  loss
+# Pinball loss function
+pinball_loss <- function(pred, y_true, tau) {
+  # pred: [batch_size, n_quantiles]
+  # y_true: [batch_size, 1]
+  # tau: [1, n_quantiles]
+  
+  errors <- y_true - pred
+  
+  # ρ_τ(u) = τ·u if u≥0, else (τ-1)·u
+  loss <- torch_where(
+    errors >= 0,
+    tau * errors,
+    (tau - 1) * errors
+  )
+  
+  torch_mean(loss)
 }
 
-# Train M independent networks
-ensemble_nets <- vector("list", M_ens)
+# Train M independent quantile regression networks
+ensemble_qrnns <- vector("list", M_ens)
 
 for (m in seq_len(M_ens)) {
   cat(sprintf("Training ensemble member %d / %d ...\n", m, M_ens))
   
-  net   <- make_prob_net(n_input)
+  net   <- make_qrnn(n_input, n_quantiles)
   optim <- optim_adam(net$parameters, lr = 0.001)
   
   net$train()
-  for (epoch in seq_len(100)) {
+  for (epoch in seq_len(150)) {  # More epochs for quantile regression convergence
     optim$zero_grad()
     pred <- net(X_tr_t)
-    loss <- gauss_nll(pred, y_tr_t)
+    loss <- pinball_loss(pred, y_tr_t, tau_t)
     loss$backward()
     optim$step()
+    
+    if (epoch %% 50 == 0) {
+      cat(sprintf("  Epoch %d, Loss: %.4f\n", epoch, as.numeric(loss)))
+    }
   }
   
   net$eval()
-  ensemble_nets[[m]] <- net
+  ensemble_qrnns[[m]] <- net
 }
 
-# Predict: collect (mu_m, sigma2_m) from each network on the test set
+# Predict: collect quantiles from each network
 with_no_grad({
-  preds_list <- lapply(ensemble_nets, function(net) {
-    out    <- net(X_te_t)
-    mu_sc  <- as.numeric(out[, 1])
-    var_sc <- as.numeric(softplus(as.numeric(out[, 2]))) + 1e-6
-    list(mu = mu_sc, var = var_sc)
+  qpreds_list <- lapply(ensemble_qrnns, function(net) {
+    out_sc <- net(X_te_t)
+    as.matrix(out_sc)  # [n_test, n_quantiles]
   })
 })
 
-# Mixture-of-Gaussians aggregation (Section 2.4 in paper):
-#   mu*  = mean of mu_m
-#   var* = mean(var_m + mu_m^2) - mu*^2
-mu_mat  <- sapply(preds_list, `[[`, "mu")   # n_test x M
-var_mat <- sapply(preds_list, `[[`, "var")
+# Ensemble aggregation: average quantiles across networks
+qpreds_array <- array(
+  unlist(lapply(qpreds_list, as.numeric)), 
+  dim = c(nrow(Xte_ens_sc), n_quantiles, M_ens)
+)
+ens_q_sc <- apply(qpreds_array, c(1, 2), mean)
 
-mu_ens_sc  <- rowMeans(mu_mat)
-var_ens_sc <- rowMeans(var_mat + mu_mat^2) - mu_ens_sc^2
-var_ens_sc <- pmax(var_ens_sc, 1e-6)       # numerical safety
-sd_ens_sc  <- sqrt(var_ens_sc)
 
 # Back-transform to original LOS scale
-mu_ens  <- mu_ens_sc  * y_sd_ens + y_mean_ens
-sd_ens  <- sd_ens_sc  * y_sd_ens
+ens_q_all <- ens_q_sc * y_sd_ens + y_mean_ens
 
-# Extract quantiles from the mixture-Gaussian (Gaussian approximation)
+
+# Enforce monotonicity (fix quantile crossing)
+# Sort each row to ensure q_0.05 <= q_0.10 <= ... <= q_0.95
+ens_q_all <- t(apply(ens_q_all, 1, sort))
+
+
+# Apply lower bound
 lower_bound_ens <- min(y_tr, na.rm = TRUE)
+ens_q_all <- pmax(ens_q_all, lower_bound_ens)
+
+
+# Extract key quantiles
+q05_idx <- which.min(abs(q_grid - 0.05))
+q50_idx <- which.min(abs(q_grid - 0.50))
+q95_idx <- which.min(abs(q_grid - 0.95))
+
 ens_q <- data.frame(
-  q05 = pmax(qnorm(0.05, mean = mu_ens, sd = sd_ens), lower_bound_ens),
-  q50 = qnorm(0.50, mean = mu_ens, sd = sd_ens),
-  q95 = qnorm(0.95, mean = mu_ens, sd = sd_ens)
+  q05 = ens_q_all[, q05_idx],
+  q50 = ens_q_all[, q50_idx],
+  q95 = ens_q_all[, q95_idx]
 )
 
 # Dense quantile grid for CRPS
-ens_qgrid_mat <- sapply(q_grid, function(p)
-  pmax(qnorm(p, mean = mu_ens, sd = sd_ens), lower_bound_ens))
-ens_qgrid <- as.data.frame(ens_qgrid_mat)
+ens_qgrid <- as.data.frame(ens_q_all)
 colnames(ens_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
 
-# 7-MC Dropout (Gal & Ghahramani, 2016)
-# Approximate Bayesian inference via dropout at test time
-# Keep dropout enabled during prediction and sample M times
-# Aggregate predictions to estimate predictive uncertainty
+cat("Deep Ensemble (QRNN) training complete.\n\n")
 
-cat("\nTraining MC Dropout model...\n")
+# ========================================
+# 7-MC Dropout (Non-Parametric Version)
+# Quantile Regression with Dropout
+# ========================================
+
+cat("\n=== Training MC Dropout (Quantile Regression) ===\n")
 
 set.seed(2026)
 
-# Number of forward passes at test time (paper recommends 50-100)
+# Number of forward passes at test time
 M_dropout <- 100
 
-# Dropout rate (common choices: 0.1 for regression, 0.5 for classification)
+# Dropout rate
 dropout_rate <- 0.1
 
-# Define network with dropout layers
-# Architecture matches Deep Ensembles for fair comparison
-mc_dropout_net <- nn_sequential(
+
+# Define QRNN with dropout
+mc_dropout_qrnn <- nn_sequential(
   nn_linear(n_input, 128),
   nn_relu(),
   nn_dropout(p = dropout_rate),
   nn_linear(128, 64),
   nn_relu(),
   nn_dropout(p = dropout_rate),
-  nn_linear(64, 2)   # output: [mu, raw_var]
+  nn_linear(64, n_quantiles)   # output: quantiles directly
 )
 
-# Set opitimizer
-optim_mc <- optim_adam(mc_dropout_net$parameters, lr = 0.001)
 
-# Start training
-mc_dropout_net$train()
-for (epoch in seq_len(100)) {
-  # Reset gradients from previous iteration
+# Train with dropout enabled
+optim_mc <- optim_adam(mc_dropout_qrnn$parameters, lr = 0.001)
+
+mc_dropout_qrnn$train()
+for (epoch in seq_len(150)) {
   optim_mc$zero_grad()
-  # Forward pass: compute model predictions
-  pred <- mc_dropout_net(X_tr_t)
-  # Compute Gaussian NLL loss
-  loss <- gauss_nll(pred, y_tr_t)
-  # Backpropagate gradients
+  pred <- mc_dropout_qrnn(X_tr_t)
+  loss <- pinball_loss(pred, y_tr_t, tau_t)
   loss$backward()
   optim_mc$step()
   
-  if (epoch %% 20 == 0) {
+  if (epoch %% 50 == 0) {
     cat(sprintf("  Epoch %d, Loss: %.4f\n", epoch, as.numeric(loss)))
   }
 }
 
-# CRITICAL: Keep dropout ENABLED at test time (this is the MC part)
-# Each forward pass samples a different dropout mask
-mc_dropout_net$train()  # NOT eval()! This keeps dropout active
+
+# CRITICAL: Keep dropout ENABLED at test time
+mc_dropout_qrnn$train()
 
 cat(sprintf("Generating %d MC samples...\n", M_dropout))
 
+
 # Collect M stochastic forward passes
-mc_mu_samples  <- matrix(0, nrow = nrow(Xte_ens_sc), ncol = M_dropout)
-mc_var_samples <- matrix(0, nrow = nrow(Xte_ens_sc), ncol = M_dropout)
+mc_q_samples <- array(0, dim = c(nrow(Xte_ens_sc), n_quantiles, M_dropout))
 
 with_no_grad({
   for (i in seq_len(M_dropout)) {
-    pred_i <- mc_dropout_net(X_te_t)
-    mc_mu_samples[, i]  <- as.numeric(pred_i[, 1])
-    mc_var_samples[, i] <- as.numeric(softplus(as.numeric(pred_i[, 2]))) + 1e-6
+    pred_i <- mc_dropout_qrnn(X_te_t)
+    mc_q_samples[, , i] <- as.matrix(pred_i)
   }
 })
 
-# Aggregate MC samples: mean of means, and total variance
-# Total variance = epistemic (variance of means) + aleatoric (mean of variances)
-mu_mc_sc  <- rowMeans(mc_mu_samples)
-var_epistemic <- apply(mc_mu_samples, 1, var)         # model uncertainty
-var_aleatoric <- rowMeans(mc_var_samples)             # data uncertainty
-var_mc_sc <- var_epistemic + var_aleatoric
-var_mc_sc <- pmax(var_mc_sc, 1e-6)
-sd_mc_sc  <- sqrt(var_mc_sc)
 
-# Back-transform to original LOS scale
-mu_mc  <- mu_mc_sc  * y_sd_ens + y_mean_ens
-sd_mc  <- sd_mc_sc  * y_sd_ens
+# Aggregate: average quantiles across MC samples
+mcd_q_sc <- apply(mc_q_samples, c(1, 2), mean)
 
-# Extract quantiles (assuming Gaussian predictive distribution)
+
+# Back-transform
+mcd_q_all <- mcd_q_sc * y_sd_ens + y_mean_ens
+
+
+# Enforce monotonicity
+mcd_q_all <- t(apply(mcd_q_all, 1, sort))
+
+
+# Apply lower bound
 lower_bound_mc <- min(y_tr, na.rm = TRUE)
+mcd_q_all <- pmax(mcd_q_all, lower_bound_mc)
+
+
+# Extract key quantiles
 mcd_q <- data.frame(
-  q05 = pmax(qnorm(0.05, mean = mu_mc, sd = sd_mc), lower_bound_mc),
-  q50 = qnorm(0.50, mean = mu_mc, sd = sd_mc),
-  q95 = qnorm(0.95, mean = mu_mc, sd = sd_mc)
+  q05 = mcd_q_all[, q05_idx],
+  q50 = mcd_q_all[, q50_idx],
+  q95 = mcd_q_all[, q95_idx]
 )
 
-# Dense quantile grid for CRPS
-mcd_qgrid_mat <- sapply(q_grid, function(p)
-  pmax(qnorm(p, mean = mu_mc, sd = sd_mc), lower_bound_mc))
-mcd_qgrid <- as.data.frame(mcd_qgrid_mat)
+
+# Dense quantile grid
+mcd_qgrid <- as.data.frame(mcd_q_all)
 colnames(mcd_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
 
-cat("MC Dropout training complete.\n\n")
+cat("MC Dropout (QRNN) training complete.\n\n")
+
 
 # evaluation
 # Evaluate prediction interval performance
@@ -1191,8 +1215,7 @@ crps_all_grid
 
 
 # ---- NLL (Negative Log-Likelihood) evaluation ----
-# For DRF/QRF/RF: approximate density from quantile grid via numerical differentiation
-# For ENS/MCD: use analytical Gaussian likelihood
+# All models now use non-parametric density approximation from quantile grids
 # XGB skipped: conformal prediction does not provide explicit probability density
 
 # Helper: approximate PDF from quantile predictions
@@ -1272,12 +1295,13 @@ nll_qrf <- -mean(log(qrf_densities))
 rf_densities <- approx_density_from_quantiles(y_te, as.matrix(rf_qgrid), q_grid)
 nll_rf <- -mean(log(rf_densities))
 
-# ENS: analytical Gaussian NLL
-# NLL = 0.5 * log(2π) + 0.5 * log(σ²) + 0.5 * (y - μ)² / σ²
-nll_ens <- mean(0.5 * log(2 * pi) + log(sd_ens) + 0.5 * ((y_te - mu_ens) / sd_ens)^2)
+# ENS: approximate density from quantile grid (now non-parametric)
+ens_densities <- approx_density_from_quantiles(y_te, as.matrix(ens_qgrid), q_grid)
+nll_ens <- -mean(log(ens_densities))
 
-# MCD: analytical Gaussian NLL
-nll_mcd <- mean(0.5 * log(2 * pi) + log(sd_mc) + 0.5 * ((y_te - mu_mc) / sd_mc)^2)
+# MCD: approximate density from quantile grid (now non-parametric)
+mcd_densities <- approx_density_from_quantiles(y_te, as.matrix(mcd_qgrid), q_grid)
+nll_mcd <- -mean(log(mcd_densities))
 
 # Combine results (XGB omitted: no explicit density from conformal prediction)
 nll_results <- c(
@@ -1326,16 +1350,9 @@ drf_samples <- sample_from_quantiles(as.matrix(drf_qgrid), q_grid, n_samples_per
 qrf_samples <- sample_from_quantiles(as.matrix(qrf_qgrid), q_grid, n_samples_per_patient)
 rf_samples  <- sample_from_quantiles(as.matrix(rf_qgrid),  q_grid, n_samples_per_patient)
 
-# For Gaussian models: sample from N(μ, σ²)
-ens_samples <- matrix(rnorm(length(y_te) * n_samples_per_patient, 
-                            mean = rep(mu_ens, each = n_samples_per_patient),
-                            sd = rep(sd_ens, each = n_samples_per_patient)),
-                      nrow = length(y_te), ncol = n_samples_per_patient, byrow = TRUE)
-
-mcd_samples <- matrix(rnorm(length(y_te) * n_samples_per_patient,
-                            mean = rep(mu_mc, each = n_samples_per_patient),
-                            sd = rep(sd_mc, each = n_samples_per_patient)),
-                      nrow = length(y_te), ncol = n_samples_per_patient, byrow = TRUE)
+# For quantile-based models: sample using inverse CDF method
+ens_samples <- sample_from_quantiles(as.matrix(ens_qgrid), q_grid, n_samples_per_patient)
+mcd_samples <- sample_from_quantiles(as.matrix(mcd_qgrid), q_grid, n_samples_per_patient)
 
 # Flatten to long format for ggplot
 df_dist <- data.frame(
@@ -1348,7 +1365,7 @@ df_dist <- data.frame(
     as.vector(mcd_samples)        # MCD
   ),
   Model = rep(
-    c("Actual", "DRF", "QRF", "RF", "ENS (Gaussian)", "MCD (Gaussian)"),
+    c("Actual", "DRF", "QRF", "RF", "ENS", "MCD"),
     times = c(length(y_te), rep(length(y_te) * n_samples_per_patient, 5))
   )
 )
@@ -1363,7 +1380,7 @@ cat(sprintf("Total samples: %d\n", nrow(df_dist)))
 
 # 1. 数据预处理（复用你之前的 df_dist）
 # 确保 Model 是有序因子，方便排序展示
-df_dist$Model <- factor(df_dist$Model, levels = c("Actual", "DRF", "QRF", "RF", "ENS (Gaussian)", "MCD (Gaussian)"))
+df_dist$Model <- factor(df_dist$Model, levels = c("Actual", "DRF", "QRF", "RF", "ENS", "MCD"))
 
 # 创建一个专门用于绘制“背景真值”的数据框，去除 Model 列
 # 这样在 facet_wrap 时，这部分数据会在每个面板中重复出现
@@ -1392,16 +1409,16 @@ p_final <- ggplot() +
     "DRF" = "#F4A3A3",        # 更浅红
     "QRF" = "#A8C5E5",        # 更浅蓝
     "RF"  = "#B7E3B0",        # 更浅绿
-    "ENS (Gaussian)" = "#984EA3", 
-    "MCD (Gaussian)" = "#FF7F00"
+    "ENS" = "#984EA3", 
+    "MCD" = "#FF7F00"
   )) +
   
   scale_color_manual(values = c(
     "DRF" = "#D65C5C",        # 中等红
     "QRF" = "#5A9BD4",        # 中等蓝
     "RF"  = "#66BB66",        # 中等绿
-    "ENS (Gaussian)" = "#7A3E82", 
-    "MCD (Gaussian)" = "#CC6600"
+    "ENS" = "#7A3E82", 
+    "MCD" = "#CC6600"
   )) +
   
   # 坐标轴限制（根据 LOS 分布自动优化，建议展示 95% 分位数区间）
@@ -1762,5 +1779,584 @@ p_heat_delta_n <- p_heat_delta +
 
 p_heat_delta_n
 
+
+
+
+# ========================================
+# HYBRID MODEL: Neural Network Features + DRF
+# Two-Stage Learning: NN for representation, DRF for distribution
+# Hypothesis: Beats both pure NN (ENS/MCD) and pure forest (DRF/QRF)
+# ========================================
+
+cat("\n\n========================================\n")
+cat("TRAINING HYBRID MODEL: Neural Features + DRF\n")
+cat("========================================\n\n")
+
+
+# ========================================
+# Stage 1: Train Feature Extractor
+# ========================================
+
+cat("Stage 1: Training neural feature extractor...\n")
+
+set.seed(2026)
+
+# Define modular network: separate feature extractor and output head
+# This allows us to extract 64-dim features before the quantile outputs
+nn_feature_extractor <- nn_sequential(
+  nn_linear(n_input, 128),
+  nn_relu(),
+  nn_linear(128, 64),
+  nn_relu()
+)
+
+nn_output_head <- nn_linear(64, n_quantiles)
+
+
+# Pinball loss (already defined earlier, but repeat for clarity)
+if (!exists("pinball_loss")) {
+  pinball_loss <- function(pred, y_true, tau) {
+    errors <- y_true - pred
+    loss <- torch_where(
+      errors >= 0,
+      tau * errors,
+      (tau - 1) * errors
+    )
+    torch_mean(loss)
+  }
+}
+
+
+# Train the full network (feature_extractor + output_head)
+cat("  Training for 150 epochs...\n")
+
+optimizer_hybrid <- optim_adam(
+  c(nn_feature_extractor$parameters, nn_output_head$parameters), 
+  lr = 0.001
+)
+
+nn_feature_extractor$train()
+nn_output_head$train()
+
+for (epoch in seq_len(150)) {
+  optimizer_hybrid$zero_grad()
+  
+  # Forward: raw_features -> hidden_features -> quantiles
+  hidden_features <- nn_feature_extractor(X_tr_t)
+  quantile_preds <- nn_output_head(hidden_features)
+  
+  loss <- pinball_loss(quantile_preds, y_tr_t, tau_t)
+  loss$backward()
+  optimizer_hybrid$step()
+  
+  if (epoch %% 50 == 0) {
+    cat(sprintf("    Epoch %d, Loss: %.4f\n", epoch, as.numeric(loss)))
+  }
+}
+
+cat("  Neural network training complete.\n\n")
+
+
+# ========================================
+# Stage 2: Extract Learned Features
+# ========================================
+
+cat("Stage 2: Extracting 64-dimensional neural features...\n")
+
+nn_feature_extractor$eval()
+
+with_no_grad({
+  # Extract learned representations (64-dim vectors)
+  neural_features_tr <- as.matrix(nn_feature_extractor(X_tr_t))
+  neural_features_te <- as.matrix(nn_feature_extractor(X_te_t))
+})
+
+cat(sprintf("  Train: %d samples x %d features\n", nrow(neural_features_tr), ncol(neural_features_tr)))
+cat(sprintf("  Test: %d samples x %d features\n", nrow(neural_features_te), ncol(neural_features_te)))
+
+
+# Convert to data frames with proper column names
+colnames(neural_features_tr) <- paste0("nn_feat_", 1:ncol(neural_features_tr))
+colnames(neural_features_te) <- paste0("nn_feat_", 1:ncol(neural_features_te))
+
+df_neural_tr <- as.data.frame(neural_features_tr)
+df_neural_te <- as.data.frame(neural_features_te)
+
+cat("  Feature extraction complete.\n\n")
+
+
+# ========================================
+# Stage 3: Train DRF on Neural Features
+# ========================================
+
+cat("Stage 3: Training DRF on neural features (MMD splitting)...\n")
+cat("  This may take 2-3 minutes...\n")
+
+# Train DRF using neural features as input
+hybrid_drf <- drf(
+  X = df_neural_tr,
+  Y = y_tr,
+  num.trees = 1000,
+  min.node.size = 50,
+  mtry = floor(sqrt(ncol(df_neural_tr))),  # Use sqrt(64) ≈ 8 features per split
+  sample.fraction = 0.5,
+  seed = 2026
+)
+
+cat("  DRF training on neural features complete.\n\n")
+
+
+# ========================================
+# Stage 4: Generating hybrid predictions (Fixed Version)
+# ========================================
+
+library(Matrix)
+
+hybrid_pred <- predict(hybrid_drf, newdata = df_neural_te)
+
+W_h <- hybrid_pred$weights
+y_train_h <- as.numeric(hybrid_pred$y)   # 与 W_h 的列顺序严格对齐
+
+n_te <- nrow(df_neural_te)
+
+hybrid_q05 <- numeric(n_te)
+hybrid_q50 <- numeric(n_te)
+hybrid_q95 <- numeric(n_te)
+hybrid_qgrid_mat <- matrix(NA_real_, nrow = n_te, ncol = length(q_grid))
+
+wquant_robust <- function(y, w, tau) {
+  y <- as.numeric(y)
+  w <- as.numeric(w)
+  
+  # 防御式检查
+  if (length(w) != length(y)) return(NA_real_)
+  s <- sum(w)
+  if (!is.finite(s) || s <= 0) return(NA_real_)
+  
+  w <- w / s
+  
+  ord <- order(y)
+  y <- y[ord]
+  w <- w[ord]
+  cw <- cumsum(w)
+  
+  idx <- which(cw >= tau)[1]
+  if (is.na(idx)) return(y[length(y)])
+  y[idx]
+}
+
+for (i in seq_len(n_te)) {
+  
+  # 关键：把稀疏行变成“完整长度”的 dense 向量
+  w_i <- as.numeric(Matrix::as.matrix(W_h[i, ]))
+  
+  hybrid_q05[i] <- wquant_robust(y_train_h, w_i, 0.05)
+  hybrid_q50[i] <- wquant_robust(y_train_h, w_i, 0.50)
+  hybrid_q95[i] <- wquant_robust(y_train_h, w_i, 0.95)
+  
+  for (j in seq_along(q_grid)) {
+    hybrid_qgrid_mat[i, j] <- wquant_robust(y_train_h, w_i, q_grid[j])
+  }
+}
+
+hybrid_q <- data.frame(q05 = hybrid_q05, q50 = hybrid_q50, q95 = hybrid_q95)
+
+hybrid_qgrid <- as.data.frame(hybrid_qgrid_mat)
+colnames(hybrid_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
+
+
+# ========================================
+# Evaluation: Hybrid vs All Other Models
+# ========================================
+
+cat("\n========================================\n")
+cat("EVALUATION: Hybrid vs Pure Models\n")
+cat("========================================\n\n")
+
+
+# --- 1. Coverage & Width ---
+cat("1. Coverage & Interval Width:\n")
+
+# 将循环算好的向量打包进 data.frame
+hybrid_q <- data.frame(
+  q05 = hybrid_q05,
+  q50 = hybrid_q50,
+  q95 = hybrid_q95
+)
+
+# 确保没有负值（住院时间最小为训练集最小值）
+lower_bound <- min(y_tr)
+hybrid_q$q05 <- pmax(hybrid_q$q05, lower_bound)
+hybrid_q$q50 <- pmax(hybrid_q$q50, lower_bound)
+hybrid_q$q95 <- pmax(hybrid_q$q95, lower_bound)
+
+# 现在重新运行评估
+res_hybrid <- eval_interval(hybrid_q, y_te)
+
+# 重新打印表格
+comparison_table_1 <- rbind(
+  DRF = unlist(res_drf),
+  QRF = unlist(res_qrf),
+  RF  = unlist(res_rf),
+  XGB = unlist(res_xgb),
+  ENS = unlist(res_ens),
+  MCD = unlist(res_mcd),
+  HYBRID = unlist(res_hybrid)
+)
+
+print(round(comparison_table_1, 4))
+
+
+# --- 2. WIS ---
+cat("2. Weighted Interval Score (lower is better):\n")
+
+wis_hybrid <- wis_score(hybrid_q, y_te)
+
+wis_comparison <- c(
+  DRF = wis_score(drf_q, y_te),
+  QRF = wis_score(qrf_q, y_te),
+  RF  = wis_score(rf_q,  y_te),
+  XGB = wis_score(xgb_q, y_te),
+  ENS = wis_score(ens_q, y_te),
+  MCD = wis_score(mcd_q, y_te),
+  HYBRID = wis_hybrid
+)
+
+print(round(wis_comparison, 4))
+cat("\n")
+
+
+# --- 3. CRPS ---
+cat("3. CRPS (lower is better):\n")
+
+crps_hybrid <- crps_from_quantiles(y_te, as.matrix(hybrid_qgrid), q_grid)
+
+crps_comparison <- c(
+  DRF = crps_all_grid["DRF"],
+  QRF = crps_all_grid["QRF"],
+  RF  = crps_all_grid["RF"],
+  XGB = crps_all_grid["XGB"],
+  ENS = crps_all_grid["ENS"],
+  MCD = crps_all_grid["MCD"],
+  HYBRID = crps_hybrid
+)
+
+print(round(crps_comparison, 4))
+cat("\n")
+
+
+# --- 4. NLL ---
+cat("4. Negative Log-Likelihood (lower is better):\n")
+
+hybrid_densities <- approx_density_from_quantiles(y_te, as.matrix(hybrid_qgrid), q_grid)
+nll_hybrid <- -mean(log(hybrid_densities))
+
+nll_comparison <- c(
+  DRF = nll_results["DRF"],
+  QRF = nll_results["QRF"],
+  RF  = nll_results["RF"],
+  ENS = nll_results["ENS"],
+  MCD = nll_results["MCD"],
+  HYBRID = nll_hybrid
+)
+
+print(round(nll_comparison, 4))
+cat("\n")
+
+
+# ========================================
+# Key Question: Does Hybrid Beat BOTH Categories?
+# ========================================
+
+cat("\n========================================\n")
+cat("HYPOTHESIS TEST: Does Hybrid Beat Both?\n")
+cat("========================================\n\n")
+
+# Define pure NN models
+pure_nn <- c("ENS", "MCD")
+pure_forest <- c("DRF", "QRF", "RF")
+
+# Best in each category (use WIS as primary metric)
+best_nn_wis <- min(wis_comparison[pure_nn], na.rm = TRUE)
+best_forest_wis <- min(wis_comparison[pure_forest], na.rm = TRUE)
+hybrid_wis <- wis_comparison["HYBRID"]
+
+cat(sprintf("Best Pure NN (WIS): %.4f (%s)\n", 
+            best_nn_wis, 
+            names(which.min(wis_comparison[pure_nn]))))
+
+cat(sprintf("Best Pure Forest (WIS): %.4f (%s)\n", 
+            best_forest_wis, 
+            names(which.min(wis_comparison[pure_forest]))))
+
+cat(sprintf("Hybrid NN+DRF (WIS): %.4f\n", hybrid_wis))
+cat("\n")
+
+
+# Verdict
+beats_nn <- hybrid_wis < best_nn_wis
+beats_forest <- hybrid_wis < best_forest_wis
+
+if (beats_nn && beats_forest) {
+  cat("✓ ✓ ✓ SUCCESS! Hybrid beats BOTH pure NN and pure forest! ✓ ✓ ✓\n\n")
+  cat(sprintf("  Improvement over best NN: %.2f%%\n", 
+              100 * (best_nn_wis - hybrid_wis) / best_nn_wis))
+  cat(sprintf("  Improvement over best forest: %.2f%%\n", 
+              100 * (best_forest_wis - hybrid_wis) / best_forest_wis))
+  cat("\n")
+  cat("INTERPRETATION:\n")
+  cat("  - Neural network learns powerful non-linear features\n")
+  cat("  - DRF uses these features for flexible distributional modeling\n")
+  cat("  - Combination captures both representation AND uncertainty better\n")
+  
+} else if (beats_nn) {
+  cat("⚠ Partial Success: Hybrid beats pure NN, but not pure forest\n")
+  cat(sprintf("  Gap to best forest: %.2f%%\n", 
+              100 * (hybrid_wis - best_forest_wis) / best_forest_wis))
+  
+} else if (beats_forest) {
+  cat("⚠ Partial Success: Hybrid beats pure forest, but not pure NN\n")
+  cat(sprintf("  Gap to best NN: %.2f%%\n", 
+              100 * (hybrid_wis - best_nn_wis) / best_nn_wis))
+  
+} else {
+  cat("✗ Hybrid does not beat either pure approach\n")
+  cat("POSSIBLE REASONS:\n")
+  cat("  - Neural features may not add information beyond raw features\n")
+  cat("  - DRF might prefer raw features for tree splitting\n")
+  cat("  - Overfitting in feature extraction stage\n")
+}
+
+
+# ========================================
+# Summary Table for Paper
+# ========================================
+
+cat("\n\n========================================\n")
+cat("SUMMARY TABLE (All Models)\n")
+cat("========================================\n\n")
+
+summary_all <- data.frame(
+  Model = c("DRF", "QRF", "RF", "XGB", "ENS", "MCD", "Hybrid_NN_DRF"),
+  Coverage = c(
+    res_drf$coverage, res_qrf$coverage, res_rf$coverage,
+    res_xgb$coverage, res_ens$coverage, res_mcd$coverage,
+    res_hybrid$coverage
+  ),
+  Width = c(
+    res_drf$width, res_qrf$width, res_rf$width,
+    res_xgb$width, res_ens$width, res_mcd$width,
+    res_hybrid$width
+  ),
+  WIS = wis_comparison,
+  CRPS = crps_comparison,
+  NLL = c(nll_comparison, NA)  # Add NA for alignment if needed
+)
+
+# Remove XGB from NLL (no density)
+summary_all$NLL[summary_all$Model == "XGB"] <- NA
+
+print(summary_all)
+
+
+# Rank models by WIS
+summary_all$WIS_Rank <- rank(summary_all$WIS, na.last = TRUE)
+
+cat("\n\nModel Rankings (by WIS, 1 = best):\n")
+print(summary_all[order(summary_all$WIS_Rank), c("Model", "WIS", "WIS_Rank")])
+
+
+# ========================================
+# Visualization: Add Hybrid to Distribution Comparison
+# ========================================
+
+cat("\n\nGenerating hybrid distribution plot...\n")
+
+# Sample from hybrid for distribution comparison
+hybrid_samples <- sample_from_quantiles(as.matrix(hybrid_qgrid), q_grid, n_samples_per_patient)
+
+# Create extended data frame
+df_dist_extended <- rbind(
+  df_dist,
+  data.frame(
+    LOS = as.vector(hybrid_samples),
+    Model = "Hybrid_NN_DRF"
+  )
+)
+
+df_dist_extended$Model <- factor(
+  df_dist_extended$Model, 
+  levels = c("Actual", "DRF", "QRF", "RF", "ENS", "MCD", "Hybrid_NN_DRF")
+)
+
+
+# Plot: Overlaid densities
+p_hybrid_overlay <- ggplot(df_dist_extended, aes(x = LOS, color = Model, linetype = Model)) +
+  geom_density(linewidth = 1.2, alpha = 0.7) +
+  
+  scale_color_manual(
+    values = c(
+      "Actual" = "black",
+      "DRF" = "#e41a1c",
+      "QRF" = "#984ea3",
+      "RF" = "#ff7f00",
+      "ENS" = "#377eb8",
+      "MCD" = "#4daf4a",
+      "Hybrid_NN_DRF" = "#a65628"  # Brown for hybrid
+    )
+  ) +
+  
+  scale_linetype_manual(
+    values = c(
+      "Actual" = "solid",
+      "DRF" = "solid",
+      "QRF" = "dashed",
+      "RF" = "dashed",
+      "ENS" = "dotted",
+      "MCD" = "dotted",
+      "Hybrid_NN_DRF" = "solid"
+    )
+  ) +
+  
+  labs(
+    title = "Hybrid Model: Neural Features + DRF",
+    subtitle = "Combining neural representation learning with distributional random forest",
+    x = "Length of Stay (Days)",
+    y = "Density"
+  ) +
+  
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold", size = 15),
+    panel.grid.minor = element_blank()
+  ) +
+  
+  coord_cartesian(xlim = c(0, quantile(y_te, 0.95) * 1.2))
+
+print(p_hybrid_overlay)
+
+ggsave("/mnt/user-data/outputs/hybrid_distribution_comparison.png",
+       plot = p_hybrid_overlay, width = 12, height = 6.5, dpi = 300)
+
+cat("✓ Plot saved to: /mnt/user-data/outputs/hybrid_distribution_comparison.png\n")
+
+
+# Plot: Faceted comparison (highlight hybrid)
+df_highlight <- df_dist_extended %>%
+  filter(Model %in% c("Actual", "DRF", "ENS", "Hybrid_NN_DRF"))
+
+p_hybrid_facet <- ggplot() +
+  geom_density(
+    data = df_highlight %>% filter(Model == "Actual"),
+    aes(x = LOS),
+    fill = "gray70", alpha = 0.3, color = "black", linewidth = 0.6
+  ) +
+  
+  geom_density(
+    data = df_highlight %>% filter(Model != "Actual"),
+    aes(x = LOS, fill = Model, color = Model),
+    alpha = 0.5, linewidth = 1
+  ) +
+  
+  facet_wrap(~ Model, ncol = 3, scales = "free_y") +
+  
+  scale_fill_manual(
+    values = c(
+      "DRF" = "#e41a1c",
+      "ENS" = "#377eb8",
+      "Hybrid_NN_DRF" = "#4daf4a"
+    )
+  ) +
+  
+  scale_color_manual(
+    values = c(
+      "DRF" = "#e41a1c",
+      "ENS" = "#377eb8",
+      "Hybrid_NN_DRF" = "#4daf4a"
+    )
+  ) +
+  
+  labs(
+    title = "Hybrid vs Pure Models: Distribution Fit",
+    subtitle = "Gray background = actual distribution in each panel",
+    x = "Length of Stay (Days)",
+    y = "Density"
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 14),
+    strip.background = element_rect(fill = "#f0f0f0", color = "gray80"),
+    strip.text = element_text(face = "bold")
+  ) +
+  
+  coord_cartesian(xlim = c(0, quantile(y_te, 0.95) * 1.2))
+
+print(p_hybrid_facet)
+
+ggsave("/mnt/user-data/outputs/hybrid_facet_comparison.png",
+       plot = p_hybrid_facet, width = 11, height = 5, dpi = 300)
+
+cat("✓ Plot saved to: /mnt/user-data/outputs/hybrid_facet_comparison.png\n")
+
+
+# ========================================
+# Feature Importance: Which Neural Features Matter?
+# ========================================
+
+cat("\n\n========================================\n")
+cat("NEURAL FEATURE IMPORTANCE\n")
+cat("========================================\n\n")
+
+# Extract variable importance from DRF
+var_importance <- hybrid_drf$variable.importance
+
+cat("Top 15 most important neural features for DRF splitting:\n")
+top_features <- head(sort(var_importance, decreasing = TRUE), 15)
+print(round(top_features, 4))
+
+cat("\n")
+cat("INTERPRETATION:\n")
+cat("  - DRF identifies which learned representations are most useful\n")
+cat("  - High importance = feature strongly discriminates LOS distributions\n")
+cat("  - This validates that neural features encode predictive information\n")
+
+
+# ========================================
+# Save Hybrid Model Results
+# ========================================
+
+cat("\n\n========================================\n")
+cat("SAVING RESULTS\n")
+cat("========================================\n\n")
+
+hybrid_results <- list(
+  # Predictions
+  quantiles = hybrid_q,
+  quantile_grid = hybrid_qgrid,
+  
+  # Features
+  neural_features_train = neural_features_tr,
+  neural_features_test = neural_features_te,
+  
+  # Models
+  feature_extractor = nn_feature_extractor,
+  drf_model = hybrid_drf,
+  
+  # Metrics
+  summary_table = summary_all,
+  wis_comparison = wis_comparison,
+  feature_importance = var_importance
+)
+
+saveRDS(hybrid_results, "/mnt/user-data/outputs/hybrid_nn_drf_results.rds")
+cat("✓ Results saved to: /mnt/user-data/outputs/hybrid_nn_drf_results.rds\n")
+
+
+cat("\n\n========================================\n")
+cat("✓ ✓ ✓ HYBRID MODEL EVALUATION COMPLETE ✓ ✓ ✓\n")
+cat("========================================\n\n")
 
 
