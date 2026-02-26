@@ -85,12 +85,11 @@ df2 <- df2 %>% mutate(across(all_of(cat_cols), ~as.factor(trimws(.x))))
 num_cols <- names(df2)[sapply(df2, is.numeric)]
 num_cols <- setdiff(num_cols, "y")
 
-# ----------------------------------
-# Create global missingness feature
-# ----------------------------------
-
-# proportion of missing values per row
-df2$global_missing_rate <- rowMeans(is.na(df2))
+# Create a new column named original_variable + "_miss"
+# Assign 1 if missing, 0 otherwise
+for (v in num_cols) {
+  df2[[paste0(v, "_miss")]] <- as.integer(is.na(df2[[v]]))
+}
 # prepare a imputed dataset for QRF
 # extract and parse admission time from the original dataframe
 df_time <- df %>%
@@ -102,8 +101,7 @@ df2 <- df2 %>%
   left_join(df_time, by = c("subject_id","hadm_id"))
 
 # Remove ID variables and their missingness indicators
-df2 <- df2 %>% select(-subject_id, ,- hadm_id, -hadm_id_first)
-
+df2 <- df2 %>% select(-subject_id, -hadm_id, -subject_id_miss, -hadm_id_first_miss, -hadm_id_miss, -hadm_id_first)
 # create a new dataframe with median imputation applied on its numeric variables
 df_imp <- df2
 for (v in num_cols) {
@@ -126,41 +124,59 @@ X_tree <- df2 %>% select(-y)
 X_all  <- df_imp %>% select(-y)
 
 
+
 #-----------------------------------
 # Model training part
 #-----------------------------------
 
-# 1-data split
-
-
-# split data based on admission time
+# 1) data split (by admission time)
 cutoff <- quantile(df2$admit_dt, 0.8, na.rm = TRUE)
-# select data with 80% previous admission time as training set
 idx_train <- which(df2$admit_dt <= cutoff)
-# select data with 20% later admission time as test set
 idx_test  <- which(df2$admit_dt >  cutoff)
 
-# delete variable admit_dt
+# 2) remove admit_dt from modeling tables (but AFTER using it for split)
 df2_model <- df2 %>% select(-admit_dt)
+df_imp2   <- df_imp %>% select(-any_of("admit_dt"))
 
-# update y and X_tree
+# 3) define outcome + feature tables
 y      <- df2_model$y
 X_tree <- df2_model %>% select(-y)
+X_all  <- df_imp2 %>% select(-y)
 
-# delete admit_dt from df_imp2 and X_all
-df_imp2 <- df_imp %>%
-  select(-any_of(c("admit_dt")))
-X_all <- df_imp2 %>% select(-y)
-
-# split X_tree training set and test set based on idx_train and idx_test
-Xtr_tree <- X_tree[idx_train, ]
-Xte_tree <- X_tree[idx_test, ]
-# split y training set and test set based on idx_train and idx_test
+# 4) split train/test
+Xtr_tree <- X_tree[idx_train, , drop = FALSE]
+Xte_tree <- X_tree[idx_test,  , drop = FALSE]
 y_tr     <- y[idx_train]
 y_te     <- y[idx_test]
-# split X_all training set and test set based on idx_train and idx_test
-Xtr_all  <- X_all[idx_train, ]
-Xte_all  <- X_all[idx_test, ]
+
+Xtr_all  <- X_all[idx_train, , drop = FALSE]
+Xte_all  <- X_all[idx_test,  , drop = FALSE]
+
+# ---------------------------------------------------------
+# 5) IMPORTANT: clean tree features AFTER split (train-led)
+#    - drop useless *_miss that are all-zero in TRAIN
+#    - drop constant columns in TRAIN
+#    - apply the SAME drops to TEST
+# ---------------------------------------------------------
+miss_cols <- grep("_miss$", names(Xtr_tree), value = TRUE)
+
+miss_all_zero <- miss_cols[
+  sapply(miss_cols, function(v) sum(Xtr_tree[[v]], na.rm = TRUE) == 0)
+]
+
+const_cols <- names(Xtr_tree)[
+  sapply(Xtr_tree, function(x) dplyr::n_distinct(x, na.rm = TRUE) <= 1)
+]
+
+drop_cols_tree <- union(miss_all_zero, const_cols)
+
+Xtr_tree <- Xtr_tree %>% select(-any_of(drop_cols_tree))
+Xte_tree <- Xte_tree %>% select(-any_of(drop_cols_tree))
+
+cat("Tree feature cleanup:\n")
+cat("  Removed useless *_miss (all-zero in train):", length(miss_all_zero), "\n")
+cat("  Removed constant columns (in train):", length(const_cols), "\n")
+cat("  Xtr_tree cols:", ncol(Xtr_tree), " | Xte_tree cols:", ncol(Xte_tree), "\n")
 
 
 # For hyperparameter tuning
@@ -196,13 +212,11 @@ drf_params_test <- expand.grid(
 
 drf_cv_scores <- sapply(seq_len(nrow(drf_params_test)), function(i) {
   params <- drf_params_test[i, ]
-  
-  cat(sprintf("  [%d/%d] trees=%d, node=%d...", 
-              i, nrow(drf_params_test), 
+  cat(sprintf("  [%d/%d] trees=%d, node=%d...",
+              i, nrow(drf_params_test),
               params$num.trees, params$min.node.size))
   
-  # Simple hold-out validation (faster than full CV)
-  val_idx <- cv_folds_hp[[1]]
+  val_idx   <- cv_folds_hp[[1]]
   train_idx <- setdiff(seq_len(nrow(Xtr_tree)), val_idx)
   
   fit_cv <- drf(
@@ -210,35 +224,34 @@ drf_cv_scores <- sapply(seq_len(nrow(drf_params_test)), function(i) {
     Y = y_tr[train_idx],
     num.trees = params$num.trees,
     min.node.size = params$min.node.size,
+    sample.fraction = 0.5,
+    mtry = floor(sqrt(ncol(Xtr_tree[train_idx, ]))),
     seed = 2026
   )
   
   pred_cv <- predict(fit_cv, newdata = Xtr_tree[val_idx, ])
   
-  # Extract q05, q50, q95
+  y_train_cv <- y_tr[train_idx]   # ✅ 必须用这个
+  
   q_cv <- data.frame(
-    q05 = sapply(seq_len(nrow(Xtr_tree[val_idx, ])), function(j) {
-      wquant(pred_cv$y[[j]], pred_cv$weights[j, ], 0.05)
-    }),
-    q50 = sapply(seq_len(nrow(Xtr_tree[val_idx, ])), function(j) {
-      wquant(pred_cv$y[[j]], pred_cv$weights[j, ], 0.50)
-    }),
-    q95 = sapply(seq_len(nrow(Xtr_tree[val_idx, ])), function(j) {
-      wquant(pred_cv$y[[j]], pred_cv$weights[j, ], 0.95)
-    })
+    q05 = sapply(seq_len(nrow(Xtr_tree[val_idx, ])), function(j)
+      wquant(y_train_cv, pred_cv$weights[j, ], 0.05)),
+    q50 = sapply(seq_len(nrow(Xtr_tree[val_idx, ])), function(j)
+      wquant(y_train_cv, pred_cv$weights[j, ], 0.50)),
+    q95 = sapply(seq_len(nrow(Xtr_tree[val_idx, ])), function(j)
+      wquant(y_train_cv, pred_cv$weights[j, ], 0.95))
   )
   
-  # CORRECT: Convert to matrix and use scoringutils::wis properly
   pred_matrix <- as.matrix(q_cv[, c("q05", "q50", "q95")])
   
   wis_val <- mean(scoringutils::wis(
     observed = y_tr[val_idx],
     predicted = pred_matrix,
-    quantile_level = c(0.05, 0.5, 0.95)
+    quantile_level = c(0.05, 0.5, 0.95),
+    na.rm = TRUE
   ), na.rm = TRUE)
   
   cat(sprintf(" WIS=%.4f\n", wis_val))
-  
   wis_val
 })
 
