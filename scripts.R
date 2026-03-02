@@ -188,21 +188,54 @@ cv_folds_hp <- createFolds(y_tr, k = 3, list = TRUE, returnTrain = FALSE)
 # 2-fit drf model
 library(drf)
 
+
 set.seed(2026)
 
-# build a function to get the los for selected quantile
-wquant <- function(y, w, probs) {
-  # order by los
-  o <- order(y)
-  y <- y[o]
-  # select the weight which is matched with y's order
-  w <- w[o]
-  cw <- cumsum(w) / sum(w)
-  # to get the exact y
-  sapply(probs, function(p) y[which(cw >= p)[1]])
+# --- 优化后的核心函数 ---
+wquant_matrix <- function(y_train, W_sparse, probs) {
+  # 1. 预先排序 y_train (全局只排一次)
+  ord <- order(y_train)
+  y_sorted <- y_train[ord]
+  
+  # 2. 对稀疏矩阵 W 按 y 的顺序重排并转置，方便按行快速提取非零元素
+  # Matrix 对象的按行切片较慢，这里确保其格式优化
+  W_sorted <- W_sparse[, ord, drop = FALSE]
+  
+  n_test <- nrow(W_sorted)
+  n_probs <- length(probs)
+  res <- matrix(NA, nrow = n_test, ncol = n_probs)
+  
+  # 3. 循环处理每一行（利用稀疏矩阵内部结构）
+  for (i in 1:n_test) {
+    # 提取第 i 行的非零元素
+    row_start <- W_sorted@p[i] + 1
+    row_end   <- W_sorted@p[i+1]
+    
+    # 如果该行全为 0 (理论上 DRF 不会出现)
+    if (row_start > row_end) next
+    
+    # 获取非零权重的索引和数值
+    # 注意：dgCMatrix 是列压缩，这里如果 W_sorted 是行压缩 (dgRMatrix) 会更快
+    # 但直接使用 W_sorted[i,] 并在其中处理非零值已足够提速
+    row_data <- W_sorted[i, ]
+    nz_idx <- which(row_data != 0)
+    nz_w <- as.numeric(row_data[nz_idx])
+    nz_y <- y_sorted[nz_idx]
+    
+    # 计算累积分布
+    cw <- cumsum(nz_w) / sum(nz_w)
+    
+    # 匹配分位数点
+    for (p_idx in 1:n_probs) {
+      # 找到第一个大于等于概率 p 的位置
+      idx <- which(cw >= probs[p_idx])[1]
+      res[i, p_idx] <- nz_y[idx]
+    }
+  }
+  return(res)
 }
 
-# Hyperparameter tuning for DRF
+# --- Hyperparameter tuning ---
 cat("\nTuning DRF hyperparameters (3-fold CV)...\n")
 
 drf_params_test <- expand.grid(
@@ -230,19 +263,11 @@ drf_cv_scores <- sapply(seq_len(nrow(drf_params_test)), function(i) {
   )
   
   pred_cv <- predict(fit_cv, newdata = Xtr_tree[val_idx, ])
+  y_train_cv <- y_tr[train_idx]
   
-  y_train_cv <- y_tr[train_idx]   # ✅ 必须用这个
-  
-  q_cv <- data.frame(
-    q05 = sapply(seq_len(nrow(Xtr_tree[val_idx, ])), function(j)
-      wquant(y_train_cv, pred_cv$weights[j, ], 0.05)),
-    q50 = sapply(seq_len(nrow(Xtr_tree[val_idx, ])), function(j)
-      wquant(y_train_cv, pred_cv$weights[j, ], 0.50)),
-    q95 = sapply(seq_len(nrow(Xtr_tree[val_idx, ])), function(j)
-      wquant(y_train_cv, pred_cv$weights[j, ], 0.95))
-  )
-  
-  pred_matrix <- as.matrix(q_cv[, c("q05", "q50", "q95")])
+  # ✅ 使用优化函数直接获得矩阵
+  pred_matrix <- wquant_matrix(y_train_cv, pred_cv$weights, c(0.05, 0.5, 0.95))
+  colnames(pred_matrix) <- c("q05", "q50", "q95")
   
   wis_val <- mean(scoringutils::wis(
     observed = y_tr[val_idx],
@@ -256,16 +281,10 @@ drf_cv_scores <- sapply(seq_len(nrow(drf_params_test)), function(i) {
 })
 
 best_drf_idx <- which.min(drf_cv_scores)
-cat(sprintf("✓ Best: num.trees=%d, min.node.size=%d (WIS=%.4f)\n",
-            drf_params_test$num.trees[best_drf_idx],
-            drf_params_test$min.node.size[best_drf_idx],
-            drf_cv_scores[best_drf_idx]))
-
-# Update parameters
 num_trees_drf <- drf_params_test$num.trees[best_drf_idx]
 min_node_size_drf <- drf_params_test$min.node.size[best_drf_idx]
 
-# fit DRF
+# --- Final Fit ---
 drf_fit <- drf(
   X = Xtr_tree,
   Y = y_tr,
@@ -275,47 +294,27 @@ drf_fit <- drf(
   sample.fraction = 0.5
 )
 
-# set 3 quantile levels for calculating WIS
-q_levels <- c(0.05, 0.5, 0.95)
-
-# get the prediction outcome
-# the outcome includes weights align with y and y
 drf_pred <- predict(drf_fit, Xte_tree)
+W <- drf_pred$weights
+y_train <- as.numeric(drf_pred$y)
 
-library(Matrix)
-
-# set a range of quantiles level
-q_grid <- seq(0.05, 0.95, by = 0.05)
-
-# get weight from the outcome
-W <- drf_pred$weights  # n_test x n_train, dgCMatrix
-y_train <- as.numeric(drf_pred$y)  # get y_train from drf_pred to have the same sequence as weight
-
-
-
-# calculate predicted LOS quantiles for each test observation
-drf_q_mat <- t(sapply(1:nrow(W), function(i) {
-  w <- as.numeric(W[i, ])
-  wquant(y_train, w, q_levels)
-}))
-
-# transfer drf_q_mat as dataframe and name 3 columns (q05, q50, q95)
+# --- 1. 计算三个标准的 WIS 分位数 (修正部分) ---
+# 替换掉你原来那个慢速的 t(sapply(...))
+drf_q_mat <- wquant_matrix(y_train, W, c(0.05, 0.5, 0.95))
 drf_q <- as.data.frame(drf_q_mat)
-colnames(drf_q) <- c("q05","q50","q95")
+colnames(drf_q) <- c("q05", "q50", "q95")
 
-# ---- DRF quantile grid predictions (NEW) ----
-# Prediction for each quantile
-drf_qgrid_mat <- t(sapply(1:nrow(W), function(i) {
-  w <- as.numeric(W[i, ])
-  wquant(y_train, w, q_grid)
-}))
-
-# transfer drf_qgrid as dataframe
+# --- 2. 计算完整的分位数网格 (NEW/OPTIMIZED) ---
+q_grid <- seq(0.05, 0.95, by = 0.05)
+drf_qgrid_mat <- wquant_matrix(y_train, W, q_grid)
 drf_qgrid <- as.data.frame(drf_qgrid_mat)
 colnames(drf_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
 
+cat("\n✓ DRF 训练与预测完成。\n")
+
 
 # 3-fit QRF
+
 # Load qrf package
 library(quantregForest)
 
@@ -390,7 +389,7 @@ colnames(qrf_q) <- c("q05","q50","q95")
 
 # ---- QRF quantile grid predictions (NEW) ----
 # predict los for each quantile
-qrf_qgrid <- as.data.frame(predict(qrf_fit, Xte_all, what = q_grid))
+qrf_qgrid <- as.data.frame(predict(qrf_fit, Xte_all_mm, what = q_grid))
 colnames(qrf_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
 
 
@@ -674,158 +673,271 @@ xgb_qgrid <- as.data.frame(xgb_qgrid_mat)
 colnames(xgb_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
 
 # 6-Deep Ensembles (Lakshminarayanan et al., NIPS 2017)
-# Non-parametric extension: Quantile Regression Neural Networks
-# Each network outputs multiple quantiles directly (no distributional assumption)
+# Non-parametric extension: Quantile Regression Neural Networks (QRNN)
+# Each network outputs multiple quantiles directly
 # Ensemble prediction: average quantiles across networks
 
 library(torch)
+library(scoringutils)
 
 set.seed(2026)
 
-# Number of networks in the ensemble (paper recommends M=5)
-M_ens <- 5
+# -------------------------
+# 0) Safety checks
+# -------------------------
+stopifnot(exists("Xtr_all"), exists("Xte_all"), exists("y_tr"),
+          exists("q_grid"), exists("cv_folds_hp"))
 
-# Helper: enforce softplus positivity on variance output
-softplus <- function(x) log(1 + exp(x))
+qs <- c(0.05, 0.5, 0.95)  # for WIS key quantiles
 
-# One-hot encode categorical variables (same as XGBoost section)
-# Deep Ensembles requires fully numeric input matrix
+# -------------------------
+# 1) One-hot + standardise (same pipeline for train/test)
+# -------------------------
 Xtr_ens_mm <- model.matrix(~ . - 1, data = Xtr_all)
 Xte_ens_mm <- model.matrix(~ . - 1, data = Xte_all)
 
-# Standardise inputs (improves NN training stability)
 x_mean <- colMeans(Xtr_ens_mm)
 x_sd   <- apply(Xtr_ens_mm, 2, sd)
-x_sd[x_sd == 0] <- 1   # avoid division by zero for constant columns
+x_sd[x_sd == 0] <- 1
 
 Xtr_ens_sc <- scale(Xtr_ens_mm, center = x_mean, scale = x_sd)
 Xte_ens_sc <- scale(Xte_ens_mm, center = x_mean, scale = x_sd)
 
-# Standardise outcome (helps NLL training; predictions are back-transformed)
 y_mean_ens <- mean(y_tr)
 y_sd_ens   <- sd(y_tr)
 y_tr_sc    <- (y_tr - y_mean_ens) / y_sd_ens
 
-n_input <- ncol(Xtr_ens_sc)
+n_input     <- ncol(Xtr_ens_sc)
 n_quantiles <- length(q_grid)
 
-# Convert to torch tensors
-X_tr_t <- torch_tensor(Xtr_ens_sc, dtype = torch_float())
-y_tr_t <- torch_tensor(matrix(y_tr_sc, ncol = 1), dtype = torch_float())
-X_te_t <- torch_tensor(Xte_ens_sc, dtype = torch_float())
-
-# Quantile levels as tensor
+# quantile levels tensor
 tau_t <- torch_tensor(matrix(q_grid, nrow = 1), dtype = torch_float())
 
-# Hyperparameter tuning for Deep Ensembles
-cat("\nTuning Deep Ensembles hyperparameters (1-fold CV for speed)...\n")
+# -------------------------
+# 2) Device (CPU / MPS)
+# -------------------------
+device <- torch_device(
+  if (torch::backends_mps_is_available()) "mps" else "cpu"
+)
 
+cat("\nDeep Ensembles (QRNN) using device:", device$type, "\n")
+
+# -------------------------
+# 3) Pinball loss
+# -------------------------
+pinball_loss <- function(pred, y_true, tau) {
+  errors <- y_true - pred
+  loss <- torch_where(
+    errors >= 0,
+    tau * errors,
+    (tau - 1) * errors
+  )
+  torch_mean(loss)
+}
+
+# -------------------------
+# 4) Make QRNN with given HP
+# -------------------------
+make_qrnn_hp <- function(n_in, n_out, hidden1, hidden2) {
+  nn_sequential(
+    nn_linear(n_in, hidden1),
+    nn_relu(),
+    nn_linear(hidden1, hidden2),
+    nn_relu(),
+    nn_linear(hidden2, n_out)
+  )
+}
+
+# -------------------------
+# 5) Train ONE network (mini-batch, device-aware)
+# -------------------------
+train_one_qrnn <- function(X_train_sc, y_train_sc, hidden1, hidden2, lr,
+                           epochs = 60, batch_size = 512) {
+  net <- make_qrnn_hp(n_input, n_quantiles, hidden1, hidden2)
+  net$to(device = device)
+  optim <- optim_adam(net$parameters, lr = lr)
+  
+  ds <- dataset(
+    name = "qrnn_ds",
+    initialize = function(X, y) {
+      self$X <- X
+      self$y <- y
+    },
+    .getitem = function(i) {
+      list(x = self$X[i, ], y = self$y[i])
+    },
+    .length = function() nrow(self$X)
+  )
+  
+  X_t <- torch_tensor(X_train_sc, dtype = torch_float(), device = device)
+  y_t <- torch_tensor(matrix(y_train_sc, ncol = 1), dtype = torch_float(), device = device)
+  
+  dl <- dataloader(ds(X_t, y_t), batch_size = batch_size, shuffle = TRUE)
+  
+  net$train()
+  for (ep in seq_len(epochs)) {
+    coro::loop(for (b in dl) {
+      optim$zero_grad()
+      pred <- net(b$x)
+      loss <- pinball_loss(pred, b$y, tau_t$to(device = device))
+      loss$backward()
+      optim$step()
+    })
+  }
+  
+  net$eval()
+  net
+}
+
+# -------------------------
+# 6) Predict quantiles + WIS helper (for tuning)
+# -------------------------
+predict_key_quantiles <- function(net, X_val_sc) {
+  Xv <- torch_tensor(X_val_sc, dtype = torch_float(), device = device)
+  
+  out_sc <- with_no_grad({
+    net(Xv)
+  })
+  
+  q_all_sc <- as.matrix(out_sc$to(device = "cpu"))
+  q_all <- q_all_sc * y_sd_ens + y_mean_ens
+  
+  # enforce monotonicity (fix quantile crossing)
+  q_all <- t(apply(q_all, 1, sort))
+  
+  q05_idx <- which.min(abs(q_grid - 0.05))
+  q50_idx <- which.min(abs(q_grid - 0.50))
+  q95_idx <- which.min(abs(q_grid - 0.95))
+  
+  cbind(q_all[, q05_idx], q_all[, q50_idx], q_all[, q95_idx])
+}
+
+wis_mean_from_pred <- function(pred_mat, y_obs) {
+  mean(scoringutils::wis(
+    observed = y_obs,
+    predicted = pred_mat,
+    quantile_level = qs,
+    na.rm = TRUE
+  ), na.rm = TRUE)
+}
+
+# -------------------------
+# 7) Hyperparameter tuning (REPLACES your old placeholder tuning block)
+# -------------------------
 ens_params_test <- expand.grid(
   hidden1 = c(64, 128),
   hidden2 = c(32, 64),
   lr = c(0.0005, 0.001)
 )
 
-# NOTE: This is computationally expensive - consider reducing grid or using fewer folds
-cat("WARNING: ENS tuning is slow. Testing", nrow(ens_params_test), "combinations...\n")
+cat("\nTuning ENS (QRNN) hyperparameters with 1-fold CV...\n")
+cat("Grid size:", nrow(ens_params_test), "\n")
 
-best_ens_params <- list(hidden1 = 128, hidden2 = 64, lr = 0.001)  # Default
+# Use the SAME fold index you used elsewhere
+val_idx   <- cv_folds_hp[[1]]
+train_idx <- setdiff(seq_len(nrow(Xtr_ens_sc)), val_idx)
 
-# If you want to run tuning (uncomment):
-# ens_cv_scores <- sapply(seq_len(nrow(ens_params_test)), function(i) {
-#   params <- ens_params_test[i, ]
-#   # ... (similar to full implementation above)
-# })
+X_train_sc_tune <- Xtr_ens_sc[train_idx, , drop = FALSE]
+y_train_sc_tune <- y_tr_sc[train_idx]
 
-cat(sprintf("✓ Using: hidden1=%d, hidden2=%d, lr=%.4f\n",
-            best_ens_params$hidden1,
-            best_ens_params$hidden2,
-            best_ens_params$lr))
+X_val_sc_tune <- Xtr_ens_sc[val_idx, , drop = FALSE]
+y_val_tune    <- y_tr[val_idx]
 
-# Define Quantile Regression NN
-make_qrnn <- function(n_in, n_out) {
-  nn_sequential(
-    nn_linear(n_in, best_ens_params$hidden1),
-    nn_relu(),
-    nn_linear(best_ens_params$hidden1, best_ens_params$hidden2),
-    nn_relu(),
-    nn_linear(best_ens_params$hidden2, n_out)   # output: one value per quantile
-  )
-}
+# ---- tuning speed knobs ----
+epochs_tune <- 60
+batch_size  <- 512
+M_tune      <- 1  # tune with 1 net only for speed
 
-# Pinball loss function
-pinball_loss <- function(pred, y_true, tau) {
-  # pred: [batch_size, n_quantiles]
-  # y_true: [batch_size, 1]
-  # tau: [1, n_quantiles]
+ens_cv_scores <- sapply(seq_len(nrow(ens_params_test)), function(i) {
+  hp <- ens_params_test[i, ]
   
-  errors <- y_true - pred
+  cat(sprintf("  [%d/%d] h1=%d h2=%d lr=%.4g ...",
+              i, nrow(ens_params_test), hp$hidden1, hp$hidden2, hp$lr))
   
-  # ρ_τ(u) = τ·u if u≥0, else (τ-1)·u
-  loss <- torch_where(
-    errors >= 0,
-    tau * errors,
-    (tau - 1) * errors
-  )
+  pred_mats <- vector("list", M_tune)
+  for (m in seq_len(M_tune)) {
+    net <- train_one_qrnn(
+      X_train_sc_tune, y_train_sc_tune,
+      hidden1 = hp$hidden1,
+      hidden2 = hp$hidden2,
+      lr = hp$lr,
+      epochs = epochs_tune,
+      batch_size = batch_size
+    )
+    pred_mats[[m]] <- predict_key_quantiles(net, X_val_sc_tune)
+  }
   
-  torch_mean(loss)
-}
+  pred_avg <- Reduce(`+`, pred_mats) / M_tune
+  wis_val  <- wis_mean_from_pred(pred_avg, y_val_tune)
+  
+  cat(sprintf(" WIS=%.4f\n", wis_val))
+  wis_val
+})
 
-# Train M independent quantile regression networks
+best_i <- which.min(ens_cv_scores)
+best_ens_params <- as.list(ens_params_test[best_i, ])
+
+cat("\n✓ Best ENS params:\n")
+print(best_ens_params)
+cat("✓ Best WIS:", round(ens_cv_scores[best_i], 4), "\n")
+
+# -------------------------
+# 8) Train M ensemble members with BEST HP
+# -------------------------
+M_ens <- 5
+epochs_final <- 150
+batch_size_final <- 512
+
+cat(sprintf("\nTraining Deep Ensemble with M=%d members ...\n", M_ens))
+
 ensemble_qrnns <- vector("list", M_ens)
 
 for (m in seq_len(M_ens)) {
-  cat(sprintf("Training ensemble member %d / %d ...\n", m, M_ens))
+  cat(sprintf("  Training ensemble member %d / %d ...\n", m, M_ens))
   
-  net   <- make_qrnn(n_input, n_quantiles)
-  optim <- optim_adam(net$parameters, lr = best_ens_params$lr)
+  # different seed per member for diversity
+  set.seed(2026 + m)
   
-  net$train()
-  for (epoch in seq_len(150)) {  # More epochs for quantile regression convergence
-    optim$zero_grad()
-    pred <- net(X_tr_t)
-    loss <- pinball_loss(pred, y_tr_t, tau_t)
-    loss$backward()
-    optim$step()
-    
-    if (epoch %% 50 == 0) {
-      cat(sprintf("  Epoch %d, Loss: %.4f\n", epoch, as.numeric(loss)))
-    }
-  }
+  net <- train_one_qrnn(
+    X_train_sc = Xtr_ens_sc,
+    y_train_sc = y_tr_sc,
+    hidden1    = best_ens_params$hidden1,
+    hidden2    = best_ens_params$hidden2,
+    lr         = best_ens_params$lr,
+    epochs     = epochs_final,
+    batch_size = batch_size_final
+  )
   
-  net$eval()
   ensemble_qrnns[[m]] <- net
 }
 
-# Predict: collect quantiles from each network
-with_no_grad({
-  qpreds_list <- lapply(ensemble_qrnns, function(net) {
-    out_sc <- net(X_te_t)
-    as.matrix(out_sc)  # [n_test, n_quantiles]
-  })
-})
+# -------------------------
+# 9) Predict FULL quantile grid on test, then ensemble-average
+# -------------------------
+predict_all_quantiles <- function(net, X_sc) {
+  Xv <- torch_tensor(X_sc, dtype = torch_float(), device = device)
+  out_sc <- with_no_grad({ net(Xv) })
+  as.matrix(out_sc$to(device = "cpu"))  # [n, n_quantiles] in standardized y-space
+}
 
-# Ensemble aggregation: average quantiles across networks
+qpreds_list <- lapply(ensemble_qrnns, predict_all_quantiles, X_sc = Xte_ens_sc)
+
 qpreds_array <- array(
-  unlist(lapply(qpreds_list, as.numeric)), 
+  unlist(lapply(qpreds_list, as.numeric)),
   dim = c(nrow(Xte_ens_sc), n_quantiles, M_ens)
 )
-ens_q_sc <- apply(qpreds_array, c(1, 2), mean)
 
+ens_q_sc <- apply(qpreds_array, c(1, 2), mean)
 
 # Back-transform to original LOS scale
 ens_q_all <- ens_q_sc * y_sd_ens + y_mean_ens
 
-
 # Enforce monotonicity (fix quantile crossing)
-# Sort each row to ensure q_0.05 <= q_0.10 <= ... <= q_0.95
 ens_q_all <- t(apply(ens_q_all, 1, sort))
 
-
-# Apply lower bound
+# Apply lower bound (optional safety)
 lower_bound_ens <- min(y_tr, na.rm = TRUE)
 ens_q_all <- pmax(ens_q_all, lower_bound_ens)
-
 
 # Extract key quantiles
 q05_idx <- which.min(abs(q_grid - 0.05))
@@ -838,120 +950,275 @@ ens_q <- data.frame(
   q95 = ens_q_all[, q95_idx]
 )
 
-# Dense quantile grid for CRPS
+# Dense quantile grid for CRPS / plots
 ens_qgrid <- as.data.frame(ens_q_all)
 colnames(ens_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
 
-cat("Deep Ensemble (QRNN) training complete.\n\n")
+cat("\nDeep Ensemble (QRNN) training complete.\n\n")
 
 # ========================================
 # 7-MC Dropout (Non-Parametric Version)
-# Quantile Regression with Dropout
+# Quantile Regression with Dropout  +  Fine-tuning
 # ========================================
 
-cat("\n=== Training MC Dropout (Quantile Regression) ===\n")
+library(torch)
+library(scoringutils)
+
+cat("\n=== Training MC Dropout (Quantile Regression) with Fine-tuning ===\n")
 
 set.seed(2026)
 
-# Hyperparameter tuning for MC Dropout
-cat("\nTuning MC Dropout hyperparameters...\n")
-
-# Simple grid
-mcd_params_test <- data.frame(
-  dropout_rate = c(0.05, 0.1, 0.2),
-  lr = c(0.0005, 0.001, 0.002)
+# -------------------------
+# 0) Safety checks / required objects
+# -------------------------
+stopifnot(
+  exists("Xtr_ens_sc"), exists("Xte_ens_sc"),
+  exists("y_tr"), exists("q_grid"),
+  exists("pinball_loss"), exists("cv_folds_hp")
 )
 
-# Use reasonable defaults (tuning is slow for neural networks)
-best_mcd_params <- list(dropout_rate = 0.1, lr = 0.001)
+# key quantile indices (ensure they exist even if not defined earlier)
+q05_idx <- which.min(abs(q_grid - 0.05))
+q50_idx <- which.min(abs(q_grid - 0.50))
+q95_idx <- which.min(abs(q_grid - 0.95))
+qs      <- c(0.05, 0.5, 0.95)
 
-cat(sprintf("✓ Using: dropout_rate=%.2f, lr=%.4f\n",
-            best_mcd_params$dropout_rate,
-            best_mcd_params$lr))
+n_input     <- ncol(Xtr_ens_sc)
+n_quantiles <- length(q_grid)
 
-# Number of forward passes at test time
-M_dropout <- 100
+# quantile levels tensor
+tau_t <- torch_tensor(matrix(q_grid, nrow = 1), dtype = torch_float())
 
-# Dropout rate
-dropout_rate <- 0.1
+# -------------------------
+# 1) Device (CPU / Apple GPU via MPS)
+# -------------------------
+device <- torch_device(if (torch::backends_mps_is_available()) "mps" else "cpu")
+cat("Device:", device$type, "\n")
 
-
-# Define QRNN with dropout
-mc_dropout_qrnn <- nn_sequential(
-  nn_linear(n_input, 128),
-  nn_relu(),
-  nn_dropout(p = best_mcd_params$dropout_rate),
-  nn_linear(128, 64),
-  nn_relu(),
-  nn_dropout(p = best_mcd_params$dropout_rate),
-  nn_linear(64, n_quantiles)   # output: quantiles directly
-)
-
-
-# Train with dropout enabled
-optim_mc <- optim_adam(mc_dropout_qrnn$parameters, lr = best_mcd_params$lr)
-
-mc_dropout_qrnn$train()
-for (epoch in seq_len(150)) {
-  optim_mc$zero_grad()
-  pred <- mc_dropout_qrnn(X_tr_t)
-  loss <- pinball_loss(pred, y_tr_t, tau_t)
-  loss$backward()
-  optim_mc$step()
-  
-  if (epoch %% 50 == 0) {
-    cat(sprintf("  Epoch %d, Loss: %.4f\n", epoch, as.numeric(loss)))
-  }
+# -------------------------
+# 2) Helper: build dropout QRNN
+# -------------------------
+make_dropout_qrnn <- function(n_in, n_out, dropout_rate,
+                              hidden1 = 128, hidden2 = 64) {
+  nn_sequential(
+    nn_linear(n_in, hidden1),
+    nn_relu(),
+    nn_dropout(p = dropout_rate),
+    nn_linear(hidden1, hidden2),
+    nn_relu(),
+    nn_dropout(p = dropout_rate),
+    nn_linear(hidden2, n_out)
+  )
 }
 
+# -------------------------
+# 3) Mini-batch trainer (fast)
+# -------------------------
+train_dropout_qrnn <- function(X_train_sc, y_train_sc,
+                               dropout_rate, lr,
+                               epochs = 60, batch_size = 512,
+                               hidden1 = 128, hidden2 = 64) {
+  net <- make_dropout_qrnn(n_input, n_quantiles, dropout_rate, hidden1, hidden2)
+  net$to(device = device)
+  optim <- optim_adam(net$parameters, lr = lr)
+  
+  ds <- dataset(
+    name = "mcd_qrnn_ds",
+    initialize = function(X, y) { self$X <- X; self$y <- y },
+    .getitem = function(i) list(x = self$X[i, ], y = self$y[i]),
+    .length  = function() nrow(self$X)
+  )
+  
+  X_t <- torch_tensor(X_train_sc, dtype = torch_float(), device = device)
+  y_t <- torch_tensor(matrix(y_train_sc, ncol = 1), dtype = torch_float(), device = device)
+  dl  <- dataloader(ds(X_t, y_t), batch_size = batch_size, shuffle = TRUE)
+  
+  net$train()
+  for (ep in seq_len(epochs)) {
+    coro::loop(for (b in dl) {
+      optim$zero_grad()
+      pred <- net(b$x)
+      loss <- pinball_loss(pred, b$y, tau_t$to(device = device))
+      loss$backward()
+      optim$step()
+    })
+  }
+  
+  net
+}
 
-# CRITICAL: Keep dropout ENABLED at test time
+# -------------------------
+# 4) MC prediction on a set (keep dropout ON at test time)
+#    Return averaged key quantiles (q05,q50,q95) matrix: n x 3
+# -------------------------
+predict_mcd_key_quantiles <- function(net, X_sc,
+                                      M_pass = 30,
+                                      y_mean, y_sd,
+                                      lower_bound) {
+  X_t <- torch_tensor(X_sc, dtype = torch_float(), device = device)
+  
+  # CRITICAL: keep dropout active
+  net$train()
+  
+  n <- nrow(X_sc)
+  acc <- matrix(0, nrow = n, ncol = n_quantiles)
+  
+  with_no_grad({
+    for (i in seq_len(M_pass)) {
+      out_sc <- net(X_t)
+      out_sc_cpu <- as.matrix(out_sc$to(device = "cpu"))
+      acc <- acc + out_sc_cpu
+    }
+  })
+  
+  q_sc  <- acc / M_pass
+  q_all <- q_sc * y_sd + y_mean
+  
+  # enforce monotonicity + lower bound
+  q_all <- t(apply(q_all, 1, sort))
+  q_all <- pmax(q_all, lower_bound)
+  
+  cbind(q_all[, q05_idx], q_all[, q50_idx], q_all[, q95_idx])
+}
+
+# -------------------------
+# 5) WIS helper
+# -------------------------
+wis_mean_from_pred <- function(pred_mat_3, y_obs) {
+  mean(scoringutils::wis(
+    observed = y_obs,
+    predicted = pred_mat_3,
+    quantile_level = qs,
+    na.rm = TRUE
+  ), na.rm = TRUE)
+}
+
+# -------------------------
+# 6) Fine-tuning grid (you provided; you can expand if you want)
+# -------------------------
+cat("\nTuning MC Dropout hyperparameters (1-fold CV for speed)...\n")
+
+mcd_params_test <- expand.grid(
+  dropout_rate = c(0.05, 0.1, 0.2),
+  lr = c(0.0005, 0.001)
+)
+
+# ---- tuning speed knobs ----
+epochs_tune     <- 60
+batch_size_tune <- 512
+M_pass_tune     <- 25   # MC passes during tuning (keep small)
+
+val_idx   <- cv_folds_hp[[1]]
+train_idx <- setdiff(seq_len(nrow(Xtr_ens_sc)), val_idx)
+
+# NOTE: ENS/MCD training used y standardized earlier as y_tr_sc
+# If you already created y_mean_ens / y_sd_ens / y_tr_sc above, reuse them.
+# Otherwise compute here:
+if (!exists("y_mean_ens")) y_mean_ens <- mean(y_tr)
+if (!exists("y_sd_ens"))   y_sd_ens   <- sd(y_tr)
+if (!exists("y_tr_sc"))    y_tr_sc    <- (y_tr - y_mean_ens) / y_sd_ens
+
+X_train_sc <- Xtr_ens_sc[train_idx, , drop = FALSE]
+y_train_sc <- y_tr_sc[train_idx]
+
+X_val_sc <- Xtr_ens_sc[val_idx, , drop = FALSE]
+y_val    <- y_tr[val_idx]
+
+lower_bound_mc <- min(y_tr, na.rm = TRUE)
+
+mcd_cv_scores <- sapply(seq_len(nrow(mcd_params_test)), function(i) {
+  hp <- mcd_params_test[i, ]
+  
+  cat(sprintf("  [%d/%d] dropout=%.2f lr=%.4g ...",
+              i, nrow(mcd_params_test), hp$dropout_rate, hp$lr))
+  
+  net <- train_dropout_qrnn(
+    X_train_sc, y_train_sc,
+    dropout_rate = hp$dropout_rate,
+    lr = hp$lr,
+    epochs = epochs_tune,
+    batch_size = batch_size_tune
+  )
+  
+  pred3 <- predict_mcd_key_quantiles(
+    net, X_val_sc,
+    M_pass = M_pass_tune,
+    y_mean = y_mean_ens, y_sd = y_sd_ens,
+    lower_bound = lower_bound_mc
+  )
+  
+  wis_val <- wis_mean_from_pred(pred3, y_val)
+  cat(sprintf(" WIS=%.4f\n", wis_val))
+  wis_val
+})
+
+best_i <- which.min(mcd_cv_scores)
+best_mcd_params <- as.list(mcd_params_test[best_i, ])
+cat("\n✓ Best MCD params:\n")
+print(best_mcd_params)
+cat("✓ Best WIS:", round(mcd_cv_scores[best_i], 4), "\n\n")
+
+# -------------------------
+# 7) Train final MC Dropout model with best params (full epochs)
+# -------------------------
+cat("=== Training FINAL MC Dropout (QRNN) ===\n")
+
+epochs_final     <- 150
+batch_size_final <- 512
+M_dropout        <- 100  # Number of MC samples at test time
+
+# Final train on full training set
+mc_dropout_qrnn <- train_dropout_qrnn(
+  X_train_sc = Xtr_ens_sc,
+  y_train_sc = y_tr_sc,
+  dropout_rate = best_mcd_params$dropout_rate,
+  lr = best_mcd_params$lr,
+  epochs = epochs_final,
+  batch_size = batch_size_final
+)
+
+# -------------------------
+# 8) MC prediction on TEST set: full quantile grid (for CRPS) + key quantiles
+# -------------------------
+cat(sprintf("Generating %d MC samples on test set...\n", M_dropout))
+
+X_te_t <- torch_tensor(Xte_ens_sc, dtype = torch_float(), device = device)
+
+# Keep dropout ENABLED
 mc_dropout_qrnn$train()
 
-cat(sprintf("Generating %d MC samples...\n", M_dropout))
-
-
-# Collect M stochastic forward passes
-mc_q_samples <- array(0, dim = c(nrow(Xte_ens_sc), n_quantiles, M_dropout))
+n_te <- nrow(Xte_ens_sc)
+mc_q_samples <- array(0, dim = c(n_te, n_quantiles, M_dropout))
 
 with_no_grad({
   for (i in seq_len(M_dropout)) {
-    pred_i <- mc_dropout_qrnn(X_te_t)
-    mc_q_samples[, , i] <- as.matrix(pred_i)
+    out_sc <- mc_dropout_qrnn(X_te_t)
+    mc_q_samples[, , i] <- as.matrix(out_sc$to(device = "cpu"))
   }
 })
 
-
 # Aggregate: average quantiles across MC samples
-mcd_q_sc <- apply(mc_q_samples, c(1, 2), mean)
-
+mcd_q_sc  <- apply(mc_q_samples, c(1, 2), mean)
 
 # Back-transform
 mcd_q_all <- mcd_q_sc * y_sd_ens + y_mean_ens
 
-
-# Enforce monotonicity
+# Enforce monotonicity + lower bound
 mcd_q_all <- t(apply(mcd_q_all, 1, sort))
-
-
-# Apply lower bound
-lower_bound_mc <- min(y_tr, na.rm = TRUE)
 mcd_q_all <- pmax(mcd_q_all, lower_bound_mc)
 
-
-# Extract key quantiles
+# Key quantiles
 mcd_q <- data.frame(
   q05 = mcd_q_all[, q05_idx],
   q50 = mcd_q_all[, q50_idx],
   q95 = mcd_q_all[, q95_idx]
 )
 
-
-# Dense quantile grid
+# Dense quantile grid (for CRPS etc.)
 mcd_qgrid <- as.data.frame(mcd_q_all)
 colnames(mcd_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
 
-cat("MC Dropout (QRNN) training complete.\n\n")
+cat("MC Dropout (QRNN) fine-tuned training complete.\n\n")
 
 
 # ========================================
@@ -1001,9 +1268,6 @@ rbind(
   MCD = unlist(res_mcd)
 )
 
-# library scoringutils to use wis function
-install.packages("scoringutils")
-library(scoringutils)
 
 # Compute mean Weighted Interval Score
 wis_score <- function(q, y, na.rm = TRUE) {
