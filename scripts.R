@@ -383,13 +383,12 @@ qrf_fit <- quantregForest(
 
 # predict the outcome and store in dataframe format
 qrf_q <- as.data.frame(
-  predict(qrf_fit, Xte_all, what = q_levels)
+  predict(qrf_fit, Xte_all, what = qs)
 )
 colnames(qrf_q) <- c("q05","q50","q95")
 
-# ---- QRF quantile grid predictions (NEW) ----
-# predict los for each quantile
-qrf_qgrid <- as.data.frame(predict(qrf_fit, Xte_all_mm, what = q_grid))
+# ---- QRF quantile grid predictions ----
+qrf_qgrid <- as.data.frame(predict(qrf_fit, Xte_all, what = q_grid))
 colnames(qrf_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
 
 
@@ -473,7 +472,7 @@ rf_q_fit <- ranger(
 
 # get the results and store in dataframe format
 rf_q <- as.data.frame(
-  predict(rf_q_fit, Xte_all, type = "quantiles", quantiles = q_levels)$predictions
+  predict(rf_q_fit, Xte_all, type = "quantiles", quantiles = qs)$predictions
 )
 colnames(rf_q) <- c("q05","q50","q95")
 
@@ -629,6 +628,20 @@ params <- list(
   eta = eta_xgb
 )
 
+# --- Build final DMatrices with proper train/cal/test split ---
+set.seed(2026)
+n_tr_full    <- nrow(Xtr_all_mm_hp)
+cal_size_fin <- floor(0.15 * n_tr_full)
+cal_idx_fin  <- sample(seq_len(n_tr_full), size = cal_size_fin)
+train_idx_fin <- setdiff(seq_len(n_tr_full), cal_idx_fin)
+
+dtrain <- xgb.DMatrix(Xtr_all_mm_hp[train_idx_fin, , drop = FALSE],
+                      label = y_tr[train_idx_fin])
+dcal   <- xgb.DMatrix(Xtr_all_mm_hp[cal_idx_fin,   , drop = FALSE],
+                      label = y_tr[cal_idx_fin])
+dtest  <- xgb.DMatrix(Xte_all_mm)
+y_cal  <- y_tr[cal_idx_fin]
+
 # model training
 xgb_fit <- xgb.train(
   params = params,
@@ -672,2323 +685,1114 @@ xgb_qgrid_mat <- sapply(scale_tau2, function(s) pred_test + s * q_hat)
 xgb_qgrid <- as.data.frame(xgb_qgrid_mat)
 colnames(xgb_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
 
-# 6-Deep Ensembles (Lakshminarayanan et al., NIPS 2017)
-# Non-parametric extension: Quantile Regression Neural Networks (QRNN)
-# Each network outputs multiple quantiles directly
-# Ensemble prediction: average quantiles across networks
-
+# ============================================================
+# SHARED SETUP FOR ALL NEURAL MODELS
+# ============================================================
 library(torch)
 library(scoringutils)
 
 set.seed(2026)
+qs          <- c(0.05, 0.5, 0.95)
+q05_idx     <- which.min(abs(q_grid - 0.05))
+q50_idx     <- which.min(abs(q_grid - 0.50))
+q95_idx     <- which.min(abs(q_grid - 0.95))
 
-# -------------------------
-# 0) Safety checks
-# -------------------------
-stopifnot(exists("Xtr_all"), exists("Xte_all"), exists("y_tr"),
-          exists("q_grid"), exists("cv_folds_hp"))
+# One-hot encode + standardise X  (train-led, applied to test)
+Xtr_ens_mm  <- model.matrix(~ . - 1, data = Xtr_all)
+Xte_ens_mm  <- model.matrix(~ . - 1, data = Xte_all)
+# align columns
+common_nn   <- union(colnames(Xtr_ens_mm), colnames(Xte_ens_mm))
+Xtr_ens_mm  <- Xtr_ens_mm[, common_nn, drop = FALSE]; Xtr_ens_mm[is.na(Xtr_ens_mm)] <- 0
+Xte_ens_mm  <- Xte_ens_mm[, common_nn, drop = FALSE]; Xte_ens_mm[is.na(Xte_ens_mm)] <- 0
 
-qs <- c(0.05, 0.5, 0.95)  # for WIS key quantiles
-
-# -------------------------
-# 1) One-hot + standardise (same pipeline for train/test)
-# -------------------------
-Xtr_ens_mm <- model.matrix(~ . - 1, data = Xtr_all)
-Xte_ens_mm <- model.matrix(~ . - 1, data = Xte_all)
-
-x_mean <- colMeans(Xtr_ens_mm)
-x_sd   <- apply(Xtr_ens_mm, 2, sd)
-x_sd[x_sd == 0] <- 1
-
-Xtr_ens_sc <- scale(Xtr_ens_mm, center = x_mean, scale = x_sd)
-Xte_ens_sc <- scale(Xte_ens_mm, center = x_mean, scale = x_sd)
-
-y_mean_ens <- mean(y_tr)
-y_sd_ens   <- sd(y_tr)
-y_tr_sc    <- (y_tr - y_mean_ens) / y_sd_ens
+x_mean      <- colMeans(Xtr_ens_mm)
+x_sd        <- apply(Xtr_ens_mm, 2, sd); x_sd[x_sd == 0] <- 1
+Xtr_ens_sc  <- scale(Xtr_ens_mm, center = x_mean, scale = x_sd)
+Xte_ens_sc  <- scale(Xte_ens_mm, center = x_mean, scale = x_sd)
 
 n_input     <- ncol(Xtr_ens_sc)
 n_quantiles <- length(q_grid)
 
-# quantile levels tensor
-tau_t <- torch_tensor(matrix(q_grid, nrow = 1), dtype = torch_float())
+# Device
+device <- torch_device(if (torch::backends_mps_is_available()) "mps" else "cpu")
+cat("Neural models using device:", device$type, "\n")
 
-# -------------------------
-# 2) Device (CPU / MPS)
-# -------------------------
-device <- torch_device(
-  if (torch::backends_mps_is_available()) "mps" else "cpu"
+# Shared CV fold
+val_idx_nn   <- cv_folds_hp[[1]]
+train_idx_nn <- setdiff(seq_len(nrow(Xtr_ens_sc)), val_idx_nn)
+X_tr_cv      <- Xtr_ens_sc[train_idx_nn, , drop = FALSE]
+y_tr_cv      <- y_tr[train_idx_nn]
+X_va_cv      <- Xtr_ens_sc[val_idx_nn,   , drop = FALSE]
+y_va_cv      <- y_tr[val_idx_nn]
+
+# ============================================================
+# SHARED: Gamma NLL loss (log-space params -> shape, rate)
+# ============================================================
+gamma_nll_loss <- function(params, y_true) {
+  # params: [B, 2]  col1=log_shape, col2=log_rate
+  shape <- torch_exp(params[, 1, drop = FALSE])
+  rate  <- torch_exp(params[, 2, drop = FALSE])
+  nll   <- -(
+    (shape - 1) * torch_log(y_true + 1e-8) -
+      rate  * y_true +
+      shape * torch_log(rate + 1e-8) -
+      torch_lgamma(shape)
+  )
+  torch_mean(nll)
+}
+
+# ============================================================
+# SHARED: Dataset / DataLoader builder
+# ============================================================
+make_dl <- function(X_sc, y_obs, batch_size = 512) {
+  ds_def <- dataset(
+    name       = "gamma_ds",
+    initialize = function(X, y) { self$X <- X; self$y <- y },
+    .getitem   = function(i)    list(x = self$X[i, ], y = self$y[i]),
+    .length    = function()     nrow(self$X)
+  )
+  X_t <- torch_tensor(X_sc,                    dtype = torch_float(), device = device)
+  y_t <- torch_tensor(matrix(y_obs, ncol = 1), dtype = torch_float(), device = device)
+  dataloader(ds_def(X_t, y_t), batch_size = batch_size, shuffle = TRUE)
+}
+
+# ============================================================
+# SHARED: extract Gamma params from net  ->  list(shape, rate)
+# ============================================================
+get_gamma_params <- function(net, X_sc) {
+  Xv     <- torch_tensor(X_sc, dtype = torch_float(), device = device)
+  params <- with_no_grad({ net(Xv) })
+  pm     <- as.matrix(params$to(device = "cpu"))
+  list(shape = exp(pm[, 1]), rate = exp(pm[, 2]))
+}
+
+# ============================================================
+# SHARED: quantile grid from Gamma params
+# ============================================================
+gamma_qgrid <- function(shape, rate, taus = q_grid) {
+  n <- length(shape); K <- length(taus)
+  out <- matrix(NA_real_, n, K)
+  for (k in seq_len(K)) out[, k] <- qgamma(taus[k], shape = shape, rate = rate)
+  out
+}
+
+# WIS helper
+gamma_wis <- function(net, X_sc, y_obs) {
+  p    <- get_gamma_params(net, X_sc)
+  pmat <- gamma_qgrid(p$shape, p$rate, qs)
+  mean(scoringutils::wis(y_obs, pmat, qs, na.rm = TRUE), na.rm = TRUE)
+}
+
+# ============================================================
+# MODEL 6: Deep Ensemble (Gamma)
+# M=5 independent DNNs, each trained with Gamma NLL.
+# Prediction = mixture of M Gamma distributions (avg CDF → invert).
+# ============================================================
+cat("\n========================================\n")
+cat("MODEL 6: Deep Ensemble (Gamma DNN)\n")
+cat("========================================\n")
+
+# --- architecture ---
+make_gamma_dnn <- function(n_in, h1, h2) {
+  nn_sequential(
+    nn_linear(n_in, h1), nn_relu(),
+    nn_linear(h1,   h2), nn_relu(),
+    nn_linear(h2,    2)           # log_shape, log_rate
+  )
+}
+
+train_gamma_dnn <- function(X_sc, y_obs, h1, h2, lr, epochs = 60, batch_size = 512) {
+  net   <- make_gamma_dnn(n_input, h1, h2)$to(device = device)
+  optim <- optim_adam(net$parameters, lr = lr)
+  dl    <- make_dl(X_sc, y_obs, batch_size)
+  net$train()
+  for (ep in seq_len(epochs)) {
+    coro::loop(for (b in dl) {
+      optim$zero_grad()
+      loss <- gamma_nll_loss(net(b$x), b$y)
+      loss$backward(); optim$step()
+    })
+  }
+  net$eval(); net
+}
+
+# HP tuning
+cat("Tuning ENS-Gamma hyperparameters...\n")
+ens_grid <- expand.grid(h1 = c(64, 128), h2 = c(32, 64), lr = c(5e-4, 1e-3))
+
+ens_cv <- sapply(seq_len(nrow(ens_grid)), function(i) {
+  hp <- ens_grid[i, ]
+  cat(sprintf("  [%d/%d] h1=%d h2=%d lr=%.4g ...", i, nrow(ens_grid), hp$h1, hp$h2, hp$lr))
+  net <- train_gamma_dnn(X_tr_cv, y_tr_cv, hp$h1, hp$h2, hp$lr, epochs = 60)
+  w   <- gamma_wis(net, X_va_cv, y_va_cv)
+  cat(sprintf(" WIS=%.4f\n", w)); w
+})
+
+best_ens_hp  <- as.list(ens_grid[which.min(ens_cv), ])
+cat(sprintf("✓ Best ENS-Gamma: h1=%d h2=%d lr=%.4g (WIS=%.4f)\n",
+            best_ens_hp$h1, best_ens_hp$h2, best_ens_hp$lr, min(ens_cv)))
+
+# Train M members
+M_ens         <- 5
+ens_members   <- vector("list", M_ens)
+cat(sprintf("Training %d ENS-Gamma members (150 epochs each)...\n", M_ens))
+for (m in seq_len(M_ens)) {
+  set.seed(2026 + m)
+  cat(sprintf("  Member %d/%d\n", m, M_ens))
+  ens_members[[m]] <- train_gamma_dnn(Xtr_ens_sc, y_tr,
+                                      best_ens_hp$h1, best_ens_hp$h2, best_ens_hp$lr,
+                                      epochs = 150)
+}
+
+# Predict: mixture of M Gamma CDFs (averaged per patient)
+cat("Computing ENS-Gamma predictions (mixture CDF inversion)...\n")
+
+ens_shapes <- lapply(ens_members, function(net) get_gamma_params(net, Xte_ens_sc)$shape)
+ens_rates  <- lapply(ens_members, function(net) get_gamma_params(net, Xte_ens_sc)$rate)
+
+n_te_ens  <- nrow(Xte_ens_sc)
+n_cdf_pts <- 800  # resolution for CDF inversion
+ens_qgrid_mat <- matrix(NA_real_, n_te_ens, length(q_grid))
+
+for (i in seq_len(n_te_ens)) {
+  # per-patient range
+  ql <- min(sapply(seq_len(M_ens), function(m) qgamma(0.001, ens_shapes[[m]][i], ens_rates[[m]][i])))
+  qh <- max(sapply(seq_len(M_ens), function(m) qgamma(0.999, ens_shapes[[m]][i], ens_rates[[m]][i])))
+  xg <- seq(max(ql, 1e-6), qh, length.out = n_cdf_pts)
+  # mixture CDF = average over members
+  mix_cdf <- rowMeans(sapply(seq_len(M_ens), function(m)
+    pgamma(xg, shape = ens_shapes[[m]][i], rate = ens_rates[[m]][i])))
+  # invert by first-crossing
+  for (k in seq_along(q_grid)) {
+    idx <- which(mix_cdf >= q_grid[k])[1]
+    ens_qgrid_mat[i, k] <- if (is.na(idx)) xg[n_cdf_pts] else xg[idx]
+  }
+}
+
+ens_q     <- data.frame(q05 = ens_qgrid_mat[, q05_idx],
+                        q50 = ens_qgrid_mat[, q50_idx],
+                        q95 = ens_qgrid_mat[, q95_idx])
+ens_qgrid <- as.data.frame(ens_qgrid_mat)
+colnames(ens_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
+
+# NLL: log-mixture density = log(mean(exp(log_dens_m)))
+ens_log_dens_list <- lapply(seq_len(M_ens), function(m)
+  dgamma(y_te, shape = ens_shapes[[m]], rate = ens_rates[[m]], log = TRUE))
+nll_ens <- -mean(log(rowMeans(exp(do.call(cbind, ens_log_dens_list)) + 1e-300)))
+
+cat("ENS-Gamma complete.\n\n")
+
+
+# ============================================================
+# MODEL 7: MC Dropout (Gamma)
+# Single DNN with dropout; at test time keep dropout ON and
+# average shape/rate over M forward passes → one Gamma per patient.
+# ============================================================
+cat("========================================\n")
+cat("MODEL 7: MC Dropout (Gamma DNN)\n")
+cat("========================================\n")
+
+make_gamma_dropout_dnn <- function(n_in, h1 = 128, h2 = 64, p_drop = 0.1) {
+  nn_sequential(
+    nn_linear(n_in, h1), nn_relu(), nn_dropout(p_drop),
+    nn_linear(h1,   h2), nn_relu(), nn_dropout(p_drop),
+    nn_linear(h2,    2)
+  )
+}
+
+train_gamma_dropout_dnn <- function(X_sc, y_obs, p_drop, lr,
+                                    h1 = 128, h2 = 64, epochs = 60, batch_size = 512) {
+  net   <- make_gamma_dropout_dnn(n_input, h1, h2, p_drop)$to(device = device)
+  optim <- optim_adam(net$parameters, lr = lr)
+  dl    <- make_dl(X_sc, y_obs, batch_size)
+  net$train()
+  for (ep in seq_len(epochs)) {
+    coro::loop(for (b in dl) {
+      optim$zero_grad()
+      loss <- gamma_nll_loss(net(b$x), b$y)
+      loss$backward(); optim$step()
+    })
+  }
+  net   # leave in train() mode so dropout stays active at inference
+}
+
+mcd_avg_params <- function(net, X_sc, M_pass = 50) {
+  net$train()  # keep dropout ON
+  X_t <- torch_tensor(X_sc, dtype = torch_float(), device = device)
+  acc_s <- acc_r <- matrix(0, nrow(X_sc), 1)
+  with_no_grad({
+    for (p in seq_len(M_pass)) {
+      pm   <- as.matrix(net(X_t)$to(device = "cpu"))
+      acc_s <- acc_s + exp(pm[, 1, drop = FALSE])
+      acc_r <- acc_r + exp(pm[, 2, drop = FALSE])
+    }
+  })
+  list(shape = as.vector(acc_s / M_pass), rate = as.vector(acc_r / M_pass))
+}
+
+# HP tuning
+cat("Tuning MCD-Gamma hyperparameters...\n")
+mcd_grid <- expand.grid(p_drop = c(0.05, 0.10, 0.20), lr = c(5e-4, 1e-3))
+
+mcd_cv <- sapply(seq_len(nrow(mcd_grid)), function(i) {
+  hp  <- mcd_grid[i, ]
+  cat(sprintf("  [%d/%d] dropout=%.2f lr=%.4g ...", i, nrow(mcd_grid), hp$p_drop, hp$lr))
+  net <- train_gamma_dropout_dnn(X_tr_cv, y_tr_cv, hp$p_drop, hp$lr, epochs = 60)
+  p   <- mcd_avg_params(net, X_va_cv, M_pass = 25)
+  pm  <- gamma_qgrid(p$shape, p$rate, qs)
+  w   <- mean(scoringutils::wis(y_va_cv, pm, qs, na.rm = TRUE), na.rm = TRUE)
+  cat(sprintf(" WIS=%.4f\n", w)); w
+})
+
+best_mcd_hp <- as.list(mcd_grid[which.min(mcd_cv), ])
+cat(sprintf("✓ Best MCD-Gamma: dropout=%.2f lr=%.4g (WIS=%.4f)\n",
+            best_mcd_hp$p_drop, best_mcd_hp$lr, min(mcd_cv)))
+
+set.seed(2026)
+cat("Training final MCD-Gamma model (150 epochs)...\n")
+mc_dropout_net <- train_gamma_dropout_dnn(Xtr_ens_sc, y_tr,
+                                          best_mcd_hp$p_drop, best_mcd_hp$lr,
+                                          epochs = 150)
+
+M_dropout     <- 100
+cat(sprintf("Generating %d MC passes on test set...\n", M_dropout))
+mcd_params_te <- mcd_avg_params(mc_dropout_net, Xte_ens_sc, M_pass = M_dropout)
+
+mcd_qgrid_mat <- gamma_qgrid(mcd_params_te$shape, mcd_params_te$rate)
+mcd_q         <- data.frame(q05 = mcd_qgrid_mat[, q05_idx],
+                            q50 = mcd_qgrid_mat[, q50_idx],
+                            q95 = mcd_qgrid_mat[, q95_idx])
+mcd_qgrid     <- as.data.frame(mcd_qgrid_mat)
+colnames(mcd_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
+
+nll_mcd <- -mean(dgamma(y_te, shape = mcd_params_te$shape,
+                        rate = mcd_params_te$rate, log = TRUE))
+cat("MCD-Gamma complete.\n\n")
+
+
+# ============================================================
+# MODEL 8: DDNN — Distributional DNN (Gamma, single model)
+# Single deterministic DNN, Gamma NLL, more epochs.
+# Captures aleatoric uncertainty only (no epistemic).
+# ============================================================
+cat("========================================\n")
+cat("MODEL 8: DDNN — Distributional DNN (Gamma)\n")
+cat("========================================\n")
+
+cat("Tuning DDNN hyperparameters...\n")
+ddnn_grid <- expand.grid(h1 = c(64, 128), h2 = c(32, 64), lr = c(5e-4, 1e-3))
+
+ddnn_cv <- sapply(seq_len(nrow(ddnn_grid)), function(i) {
+  hp  <- ddnn_grid[i, ]
+  cat(sprintf("  [%d/%d] h1=%d h2=%d lr=%.4g ...", i, nrow(ddnn_grid), hp$h1, hp$h2, hp$lr))
+  net <- train_gamma_dnn(X_tr_cv, y_tr_cv, hp$h1, hp$h2, hp$lr, epochs = 60)
+  w   <- gamma_wis(net, X_va_cv, y_va_cv)
+  cat(sprintf(" WIS=%.4f\n", w)); w
+})
+
+best_ddnn_hp <- as.list(ddnn_grid[which.min(ddnn_cv), ])
+cat(sprintf("✓ Best DDNN: h1=%d h2=%d lr=%.4g (WIS=%.4f)\n",
+            best_ddnn_hp$h1, best_ddnn_hp$h2, best_ddnn_hp$lr, min(ddnn_cv)))
+
+set.seed(2026 + 50)
+cat("Training final DDNN (200 epochs)...\n")
+ddnn_net <- train_gamma_dnn(Xtr_ens_sc, y_tr,
+                            best_ddnn_hp$h1, best_ddnn_hp$h2, best_ddnn_hp$lr,
+                            epochs = 200)
+
+ddnn_params   <- get_gamma_params(ddnn_net, Xte_ens_sc)
+ddnn_qgrid_mat <- gamma_qgrid(ddnn_params$shape, ddnn_params$rate)
+ddnn_q        <- data.frame(q05 = ddnn_qgrid_mat[, q05_idx],
+                            q50 = ddnn_qgrid_mat[, q50_idx],
+                            q95 = ddnn_qgrid_mat[, q95_idx])
+ddnn_qgrid    <- as.data.frame(ddnn_qgrid_mat)
+colnames(ddnn_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
+
+nll_ddnn <- -mean(dgamma(y_te, shape = ddnn_params$shape,
+                         rate = ddnn_params$rate, log = TRUE))
+cat("DDNN complete.\n\n")
+
+
+# ============================================================
+# MODEL 9: Ensemble DRF
+# B independent DRFs trained on bootstrap samples.
+# Prediction = average of per-member quantile grids.
+# ============================================================
+cat("========================================\n")
+cat("MODEL 9: Ensemble DRF\n")
+cat("========================================\n")
+
+B_edrf      <- 5
+edrf_members <- vector("list", B_edrf)
+cat(sprintf("Training %d DRF members on bootstrap samples...\n", B_edrf))
+
+for (b in seq_len(B_edrf)) {
+  set.seed(2026 + b * 100)
+  boot_idx <- sample(nrow(Xtr_tree), replace = TRUE)
+  cat(sprintf("  Member %d/%d (n=%d)...\n", b, B_edrf, length(boot_idx)))
+  edrf_members[[b]] <- drf(
+    X               = Xtr_tree[boot_idx, ],
+    Y               = y_tr[boot_idx],
+    num.trees       = num_trees_drf,
+    min.node.size   = min_node_size_drf,
+    mtry            = floor(sqrt(ncol(Xtr_tree))),
+    sample.fraction = 0.5,
+    seed            = 2026 + b
+  )
+}
+
+cat("Averaging quantile grids from all Ensemble-DRF members...\n")
+edrf_qgrid_list <- lapply(edrf_members, function(fit) {
+  pr <- predict(fit, Xte_tree)
+  wquant_matrix(as.numeric(pr$y), pr$weights, q_grid)
+})
+
+edrf_qgrid_mat <- Reduce(`+`, edrf_qgrid_list) / B_edrf
+edrf_q         <- data.frame(q05 = edrf_qgrid_mat[, q05_idx],
+                             q50 = edrf_qgrid_mat[, q50_idx],
+                             q95 = edrf_qgrid_mat[, q95_idx])
+edrf_qgrid     <- as.data.frame(edrf_qgrid_mat)
+colnames(edrf_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
+cat("Ensemble-DRF complete.\n\n")
+
+
+# ============================================================
+# MODEL 10: BNN — Bayesian Neural Network (Gamma, Mean-Field VI)
+# Uses Bayes-by-Backprop (local reparameterisation).
+# Prior: N(0, sigma^2_prior) on each weight.
+# Loss = Gamma NLL + KL(q||p) / N.
+# Inference: M stochastic forward passes -> average shape/rate.
+# ============================================================
+cat("========================================\n")
+cat("MODEL 10: BNN (Gamma, Mean-Field VI)\n")
+cat("========================================\n")
+
+# --- Bayesian linear layer ---
+bnn_linear <- nn_module(
+  classname = "bnn_linear",
+  initialize = function(in_f, out_f, prior_sigma = 1.0) {
+    self$prior_sigma <- prior_sigma
+    self$w_mu  <- nn_parameter(torch_randn(out_f, in_f)  * 0.01)
+    self$w_rho <- nn_parameter(torch_full(c(out_f, in_f), -3.0))
+    self$b_mu  <- nn_parameter(torch_zeros(out_f))
+    self$b_rho <- nn_parameter(torch_full(c(out_f),       -3.0))
+  },
+  forward = function(x) {
+    w_sig <- torch_log1p(torch_exp(self$w_rho))
+    b_sig <- torch_log1p(torch_exp(self$b_rho))
+    w     <- self$w_mu + w_sig * torch_randn_like(w_sig)
+    b     <- self$b_mu + b_sig * torch_randn_like(b_sig)
+    nnf_linear(x, w, b)
+  },
+  kl = function() {
+    ps   <- self$prior_sigma
+    w_s  <- torch_log1p(torch_exp(self$w_rho))
+    b_s  <- torch_log1p(torch_exp(self$b_rho))
+    kl_w <- 0.5 * torch_sum((self$w_mu^2 + w_s^2) / ps^2 - 1 - torch_log(w_s^2 / ps^2))
+    kl_b <- 0.5 * torch_sum((self$b_mu^2 + b_s^2) / ps^2 - 1 - torch_log(b_s^2 / ps^2))
+    kl_w + kl_b
+  }
 )
 
-cat("\nDeep Ensembles (QRNN) using device:", device$type, "\n")
+bnn_gamma_net <- nn_module(
+  classname = "bnn_gamma",
+  initialize = function(n_in, h1, h2, prior_sigma = 1.0) {
+    self$l1 <- bnn_linear(n_in, h1, prior_sigma)
+    self$l2 <- bnn_linear(h1,   h2, prior_sigma)
+    self$l3 <- bnn_linear(h2,    2, prior_sigma)
+  },
+  forward = function(x) {
+    x <- nnf_relu(self$l1(x))
+    x <- nnf_relu(self$l2(x))
+    self$l3(x)
+  },
+  kl = function() { self$l1$kl() + self$l2$kl() + self$l3$kl() }
+)
 
-# -------------------------
-# 3) Pinball loss
-# -------------------------
+train_bnn_gamma <- function(X_sc, y_obs, h1, h2, lr,
+                            epochs = 60, batch_size = 512, prior_sigma = 1.0) {
+  N     <- nrow(X_sc)
+  net   <- bnn_gamma_net(n_input, h1, h2, prior_sigma)$to(device = device)
+  optim <- optim_adam(net$parameters, lr = lr)
+  dl    <- make_dl(X_sc, y_obs, batch_size)
+  net$train()
+  for (ep in seq_len(epochs)) {
+    coro::loop(for (b in dl) {
+      optim$zero_grad()
+      nll  <- gamma_nll_loss(net(b$x), b$y)
+      kl   <- net$kl() / N
+      loss <- nll + kl
+      loss$backward(); optim$step()
+    })
+  }
+  net
+}
+
+bnn_avg_params <- function(net, X_sc, M_pass = 50) {
+  net$train()  # keep stochasticity ON
+  X_t   <- torch_tensor(X_sc, dtype = torch_float(), device = device)
+  acc_s <- acc_r <- matrix(0, nrow(X_sc), 1)
+  with_no_grad({
+    for (p in seq_len(M_pass)) {
+      pm    <- as.matrix(net(X_t)$to(device = "cpu"))
+      acc_s <- acc_s + exp(pm[, 1, drop = FALSE])
+      acc_r <- acc_r + exp(pm[, 2, drop = FALSE])
+    }
+  })
+  list(shape = as.vector(acc_s / M_pass), rate = as.vector(acc_r / M_pass))
+}
+
+# HP tuning
+cat("Tuning BNN hyperparameters...\n")
+bnn_grid <- expand.grid(h1 = c(64, 128), h2 = c(32, 64), lr = c(5e-4, 1e-3))
+
+bnn_cv <- sapply(seq_len(nrow(bnn_grid)), function(i) {
+  hp  <- bnn_grid[i, ]
+  cat(sprintf("  [%d/%d] h1=%d h2=%d lr=%.4g ...", i, nrow(bnn_grid), hp$h1, hp$h2, hp$lr))
+  net <- train_bnn_gamma(X_tr_cv, y_tr_cv, hp$h1, hp$h2, hp$lr, epochs = 60)
+  p   <- bnn_avg_params(net, X_va_cv, M_pass = 25)
+  pm  <- gamma_qgrid(p$shape, p$rate, qs)
+  w   <- mean(scoringutils::wis(y_va_cv, pm, qs, na.rm = TRUE), na.rm = TRUE)
+  cat(sprintf(" WIS=%.4f\n", w)); w
+})
+
+best_bnn_hp <- as.list(bnn_grid[which.min(bnn_cv), ])
+cat(sprintf("✓ Best BNN: h1=%d h2=%d lr=%.4g (WIS=%.4f)\n",
+            best_bnn_hp$h1, best_bnn_hp$h2, best_bnn_hp$lr, min(bnn_cv)))
+
+set.seed(2026 + 77)
+cat("Training final BNN (150 epochs)...\n")
+bnn_net <- train_bnn_gamma(Xtr_ens_sc, y_tr,
+                           best_bnn_hp$h1, best_bnn_hp$h2, best_bnn_hp$lr,
+                           epochs = 150)
+
+bnn_params_te  <- bnn_avg_params(bnn_net, Xte_ens_sc, M_pass = 100)
+bnn_qgrid_mat  <- gamma_qgrid(bnn_params_te$shape, bnn_params_te$rate)
+bnn_q          <- data.frame(q05 = bnn_qgrid_mat[, q05_idx],
+                             q50 = bnn_qgrid_mat[, q50_idx],
+                             q95 = bnn_qgrid_mat[, q95_idx])
+bnn_qgrid      <- as.data.frame(bnn_qgrid_mat)
+colnames(bnn_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
+
+nll_bnn <- -mean(dgamma(y_te, shape = bnn_params_te$shape,
+                        rate = bnn_params_te$rate, log = TRUE))
+cat("BNN complete.\n\n")
+
+
+# ============================================================
+# MODEL 11: Hybrid NN + DRF
+# Stage 1: QRNN (pinball loss) trains a 128→64 feature extractor.
+# Stage 2: 64-dim features fed into DRF.
+# Prediction: DRF weighted quantiles on neural features.
+# ============================================================
+cat("========================================\n")
+cat("MODEL 11: Hybrid NN + DRF\n")
+cat("========================================\n")
+
+# --- Stage 1: train QRNN feature extractor (mini-batch, pinball) ---
+cat("Stage 1: Training neural feature extractor (QRNN, 150 epochs)...\n")
+set.seed(2026)
+
+y_mean_ens  <- mean(y_tr);  y_sd_ens <- sd(y_tr)
+y_tr_sc     <- (y_tr - y_mean_ens) / y_sd_ens
+tau_t       <- torch_tensor(matrix(q_grid, nrow = 1), dtype = torch_float())
+
 pinball_loss <- function(pred, y_true, tau) {
-  errors <- y_true - pred
-  loss <- torch_where(
-    errors >= 0,
-    tau * errors,
-    (tau - 1) * errors
-  )
+  err  <- y_true - pred
+  loss <- torch_where(err >= 0, tau * err, (tau - 1) * err)
   torch_mean(loss)
 }
 
-# -------------------------
-# 4) Make QRNN with given HP
-# -------------------------
-make_qrnn_hp <- function(n_in, n_out, hidden1, hidden2) {
-  nn_sequential(
-    nn_linear(n_in, hidden1),
-    nn_relu(),
-    nn_linear(hidden1, hidden2),
-    nn_relu(),
-    nn_linear(hidden2, n_out)
-  )
-}
+nn_feat_extractor <- nn_sequential(
+  nn_linear(n_input, 128), nn_relu(),
+  nn_linear(128, 64),      nn_relu()
+)
+nn_out_head <- nn_linear(64, n_quantiles)
 
-# -------------------------
-# 5) Train ONE network (mini-batch, device-aware)
-# -------------------------
-train_one_qrnn <- function(X_train_sc, y_train_sc, hidden1, hidden2, lr,
-                           epochs = 60, batch_size = 512) {
-  net <- make_qrnn_hp(n_input, n_quantiles, hidden1, hidden2)
-  net$to(device = device)
-  optim <- optim_adam(net$parameters, lr = lr)
-  
-  ds <- dataset(
-    name = "qrnn_ds",
-    initialize = function(X, y) {
-      self$X <- X
-      self$y <- y
-    },
-    .getitem = function(i) {
-      list(x = self$X[i, ], y = self$y[i])
-    },
-    .length = function() nrow(self$X)
-  )
-  
-  X_t <- torch_tensor(X_train_sc, dtype = torch_float(), device = device)
-  y_t <- torch_tensor(matrix(y_train_sc, ncol = 1), dtype = torch_float(), device = device)
-  
-  dl <- dataloader(ds(X_t, y_t), batch_size = batch_size, shuffle = TRUE)
-  
-  net$train()
-  for (ep in seq_len(epochs)) {
-    coro::loop(for (b in dl) {
-      optim$zero_grad()
-      pred <- net(b$x)
-      loss <- pinball_loss(pred, b$y, tau_t$to(device = device))
-      loss$backward()
-      optim$step()
-    })
-  }
-  
-  net$eval()
-  net
-}
+nn_feat_extractor$to(device = device)
+nn_out_head$to(device = device)
 
-# -------------------------
-# 6) Predict quantiles + WIS helper (for tuning)
-# -------------------------
-predict_key_quantiles <- function(net, X_val_sc) {
-  Xv <- torch_tensor(X_val_sc, dtype = torch_float(), device = device)
-  
-  out_sc <- with_no_grad({
-    net(Xv)
+opt_hyb <- optim_adam(c(nn_feat_extractor$parameters, nn_out_head$parameters), lr = 1e-3)
+
+dl_hyb <- make_dl(Xtr_ens_sc, y_tr_sc, batch_size = 512)
+
+nn_feat_extractor$train(); nn_out_head$train()
+for (epoch in seq_len(150)) {
+  coro::loop(for (b in dl_hyb) {
+    opt_hyb$zero_grad()
+    feats <- nn_feat_extractor(b$x)
+    preds <- nn_out_head(feats)
+    loss  <- pinball_loss(preds, b$y, tau_t$to(device = device))
+    loss$backward(); opt_hyb$step()
   })
-  
-  q_all_sc <- as.matrix(out_sc$to(device = "cpu"))
-  q_all <- q_all_sc * y_sd_ens + y_mean_ens
-  
-  # enforce monotonicity (fix quantile crossing)
-  q_all <- t(apply(q_all, 1, sort))
-  
-  q05_idx <- which.min(abs(q_grid - 0.05))
-  q50_idx <- which.min(abs(q_grid - 0.50))
-  q95_idx <- which.min(abs(q_grid - 0.95))
-  
-  cbind(q_all[, q05_idx], q_all[, q50_idx], q_all[, q95_idx])
+  if (epoch %% 50 == 0)
+    cat(sprintf("    Epoch %d, Loss: %.4f\n", epoch, as.numeric(loss)))
 }
+cat("  Feature extractor training complete.\n\n")
 
-wis_mean_from_pred <- function(pred_mat, y_obs) {
-  mean(scoringutils::wis(
-    observed = y_obs,
-    predicted = pred_mat,
-    quantile_level = qs,
-    na.rm = TRUE
-  ), na.rm = TRUE)
-}
-
-# -------------------------
-# 7) Hyperparameter tuning (REPLACES your old placeholder tuning block)
-# -------------------------
-ens_params_test <- expand.grid(
-  hidden1 = c(64, 128),
-  hidden2 = c(32, 64),
-  lr = c(0.0005, 0.001)
-)
-
-cat("\nTuning ENS (QRNN) hyperparameters with 1-fold CV...\n")
-cat("Grid size:", nrow(ens_params_test), "\n")
-
-# Use the SAME fold index you used elsewhere
-val_idx   <- cv_folds_hp[[1]]
-train_idx <- setdiff(seq_len(nrow(Xtr_ens_sc)), val_idx)
-
-X_train_sc_tune <- Xtr_ens_sc[train_idx, , drop = FALSE]
-y_train_sc_tune <- y_tr_sc[train_idx]
-
-X_val_sc_tune <- Xtr_ens_sc[val_idx, , drop = FALSE]
-y_val_tune    <- y_tr[val_idx]
-
-# ---- tuning speed knobs ----
-epochs_tune <- 60
-batch_size  <- 512
-M_tune      <- 1  # tune with 1 net only for speed
-
-ens_cv_scores <- sapply(seq_len(nrow(ens_params_test)), function(i) {
-  hp <- ens_params_test[i, ]
-  
-  cat(sprintf("  [%d/%d] h1=%d h2=%d lr=%.4g ...",
-              i, nrow(ens_params_test), hp$hidden1, hp$hidden2, hp$lr))
-  
-  pred_mats <- vector("list", M_tune)
-  for (m in seq_len(M_tune)) {
-    net <- train_one_qrnn(
-      X_train_sc_tune, y_train_sc_tune,
-      hidden1 = hp$hidden1,
-      hidden2 = hp$hidden2,
-      lr = hp$lr,
-      epochs = epochs_tune,
-      batch_size = batch_size
-    )
-    pred_mats[[m]] <- predict_key_quantiles(net, X_val_sc_tune)
-  }
-  
-  pred_avg <- Reduce(`+`, pred_mats) / M_tune
-  wis_val  <- wis_mean_from_pred(pred_avg, y_val_tune)
-  
-  cat(sprintf(" WIS=%.4f\n", wis_val))
-  wis_val
-})
-
-best_i <- which.min(ens_cv_scores)
-best_ens_params <- as.list(ens_params_test[best_i, ])
-
-cat("\n✓ Best ENS params:\n")
-print(best_ens_params)
-cat("✓ Best WIS:", round(ens_cv_scores[best_i], 4), "\n")
-
-# -------------------------
-# 8) Train M ensemble members with BEST HP
-# -------------------------
-M_ens <- 5
-epochs_final <- 150
-batch_size_final <- 512
-
-cat(sprintf("\nTraining Deep Ensemble with M=%d members ...\n", M_ens))
-
-ensemble_qrnns <- vector("list", M_ens)
-
-for (m in seq_len(M_ens)) {
-  cat(sprintf("  Training ensemble member %d / %d ...\n", m, M_ens))
-  
-  # different seed per member for diversity
-  set.seed(2026 + m)
-  
-  net <- train_one_qrnn(
-    X_train_sc = Xtr_ens_sc,
-    y_train_sc = y_tr_sc,
-    hidden1    = best_ens_params$hidden1,
-    hidden2    = best_ens_params$hidden2,
-    lr         = best_ens_params$lr,
-    epochs     = epochs_final,
-    batch_size = batch_size_final
-  )
-  
-  ensemble_qrnns[[m]] <- net
-}
-
-# -------------------------
-# 9) Predict FULL quantile grid on test, then ensemble-average
-# -------------------------
-predict_all_quantiles <- function(net, X_sc) {
-  Xv <- torch_tensor(X_sc, dtype = torch_float(), device = device)
-  out_sc <- with_no_grad({ net(Xv) })
-  as.matrix(out_sc$to(device = "cpu"))  # [n, n_quantiles] in standardized y-space
-}
-
-qpreds_list <- lapply(ensemble_qrnns, predict_all_quantiles, X_sc = Xte_ens_sc)
-
-qpreds_array <- array(
-  unlist(lapply(qpreds_list, as.numeric)),
-  dim = c(nrow(Xte_ens_sc), n_quantiles, M_ens)
-)
-
-ens_q_sc <- apply(qpreds_array, c(1, 2), mean)
-
-# Back-transform to original LOS scale
-ens_q_all <- ens_q_sc * y_sd_ens + y_mean_ens
-
-# Enforce monotonicity (fix quantile crossing)
-ens_q_all <- t(apply(ens_q_all, 1, sort))
-
-# Apply lower bound (optional safety)
-lower_bound_ens <- min(y_tr, na.rm = TRUE)
-ens_q_all <- pmax(ens_q_all, lower_bound_ens)
-
-# Extract key quantiles
-q05_idx <- which.min(abs(q_grid - 0.05))
-q50_idx <- which.min(abs(q_grid - 0.50))
-q95_idx <- which.min(abs(q_grid - 0.95))
-
-ens_q <- data.frame(
-  q05 = ens_q_all[, q05_idx],
-  q50 = ens_q_all[, q50_idx],
-  q95 = ens_q_all[, q95_idx]
-)
-
-# Dense quantile grid for CRPS / plots
-ens_qgrid <- as.data.frame(ens_q_all)
-colnames(ens_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
-
-cat("\nDeep Ensemble (QRNN) training complete.\n\n")
-
-# ========================================
-# 7-MC Dropout (Non-Parametric Version)
-# Quantile Regression with Dropout  +  Fine-tuning
-# ========================================
-
-library(torch)
-library(scoringutils)
-
-cat("\n=== Training MC Dropout (Quantile Regression) with Fine-tuning ===\n")
-
-set.seed(2026)
-
-# -------------------------
-# 0) Safety checks / required objects
-# -------------------------
-stopifnot(
-  exists("Xtr_ens_sc"), exists("Xte_ens_sc"),
-  exists("y_tr"), exists("q_grid"),
-  exists("pinball_loss"), exists("cv_folds_hp")
-)
-
-# key quantile indices (ensure they exist even if not defined earlier)
-q05_idx <- which.min(abs(q_grid - 0.05))
-q50_idx <- which.min(abs(q_grid - 0.50))
-q95_idx <- which.min(abs(q_grid - 0.95))
-qs      <- c(0.05, 0.5, 0.95)
-
-n_input     <- ncol(Xtr_ens_sc)
-n_quantiles <- length(q_grid)
-
-# quantile levels tensor
-tau_t <- torch_tensor(matrix(q_grid, nrow = 1), dtype = torch_float())
-
-# -------------------------
-# 1) Device (CPU / Apple GPU via MPS)
-# -------------------------
-device <- torch_device(if (torch::backends_mps_is_available()) "mps" else "cpu")
-cat("Device:", device$type, "\n")
-
-# -------------------------
-# 2) Helper: build dropout QRNN
-# -------------------------
-make_dropout_qrnn <- function(n_in, n_out, dropout_rate,
-                              hidden1 = 128, hidden2 = 64) {
-  nn_sequential(
-    nn_linear(n_in, hidden1),
-    nn_relu(),
-    nn_dropout(p = dropout_rate),
-    nn_linear(hidden1, hidden2),
-    nn_relu(),
-    nn_dropout(p = dropout_rate),
-    nn_linear(hidden2, n_out)
-  )
-}
-
-# -------------------------
-# 3) Mini-batch trainer (fast)
-# -------------------------
-train_dropout_qrnn <- function(X_train_sc, y_train_sc,
-                               dropout_rate, lr,
-                               epochs = 60, batch_size = 512,
-                               hidden1 = 128, hidden2 = 64) {
-  net <- make_dropout_qrnn(n_input, n_quantiles, dropout_rate, hidden1, hidden2)
-  net$to(device = device)
-  optim <- optim_adam(net$parameters, lr = lr)
-  
-  ds <- dataset(
-    name = "mcd_qrnn_ds",
-    initialize = function(X, y) { self$X <- X; self$y <- y },
-    .getitem = function(i) list(x = self$X[i, ], y = self$y[i]),
-    .length  = function() nrow(self$X)
-  )
-  
-  X_t <- torch_tensor(X_train_sc, dtype = torch_float(), device = device)
-  y_t <- torch_tensor(matrix(y_train_sc, ncol = 1), dtype = torch_float(), device = device)
-  dl  <- dataloader(ds(X_t, y_t), batch_size = batch_size, shuffle = TRUE)
-  
-  net$train()
-  for (ep in seq_len(epochs)) {
-    coro::loop(for (b in dl) {
-      optim$zero_grad()
-      pred <- net(b$x)
-      loss <- pinball_loss(pred, b$y, tau_t$to(device = device))
-      loss$backward()
-      optim$step()
-    })
-  }
-  
-  net
-}
-
-# -------------------------
-# 4) MC prediction on a set (keep dropout ON at test time)
-#    Return averaged key quantiles (q05,q50,q95) matrix: n x 3
-# -------------------------
-predict_mcd_key_quantiles <- function(net, X_sc,
-                                      M_pass = 30,
-                                      y_mean, y_sd,
-                                      lower_bound) {
-  X_t <- torch_tensor(X_sc, dtype = torch_float(), device = device)
-  
-  # CRITICAL: keep dropout active
-  net$train()
-  
-  n <- nrow(X_sc)
-  acc <- matrix(0, nrow = n, ncol = n_quantiles)
-  
-  with_no_grad({
-    for (i in seq_len(M_pass)) {
-      out_sc <- net(X_t)
-      out_sc_cpu <- as.matrix(out_sc$to(device = "cpu"))
-      acc <- acc + out_sc_cpu
-    }
-  })
-  
-  q_sc  <- acc / M_pass
-  q_all <- q_sc * y_sd + y_mean
-  
-  # enforce monotonicity + lower bound
-  q_all <- t(apply(q_all, 1, sort))
-  q_all <- pmax(q_all, lower_bound)
-  
-  cbind(q_all[, q05_idx], q_all[, q50_idx], q_all[, q95_idx])
-}
-
-# -------------------------
-# 5) WIS helper
-# -------------------------
-wis_mean_from_pred <- function(pred_mat_3, y_obs) {
-  mean(scoringutils::wis(
-    observed = y_obs,
-    predicted = pred_mat_3,
-    quantile_level = qs,
-    na.rm = TRUE
-  ), na.rm = TRUE)
-}
-
-# -------------------------
-# 6) Fine-tuning grid (you provided; you can expand if you want)
-# -------------------------
-cat("\nTuning MC Dropout hyperparameters (1-fold CV for speed)...\n")
-
-mcd_params_test <- expand.grid(
-  dropout_rate = c(0.05, 0.1, 0.2),
-  lr = c(0.0005, 0.001)
-)
-
-# ---- tuning speed knobs ----
-epochs_tune     <- 60
-batch_size_tune <- 512
-M_pass_tune     <- 25   # MC passes during tuning (keep small)
-
-val_idx   <- cv_folds_hp[[1]]
-train_idx <- setdiff(seq_len(nrow(Xtr_ens_sc)), val_idx)
-
-# NOTE: ENS/MCD training used y standardized earlier as y_tr_sc
-# If you already created y_mean_ens / y_sd_ens / y_tr_sc above, reuse them.
-# Otherwise compute here:
-if (!exists("y_mean_ens")) y_mean_ens <- mean(y_tr)
-if (!exists("y_sd_ens"))   y_sd_ens   <- sd(y_tr)
-if (!exists("y_tr_sc"))    y_tr_sc    <- (y_tr - y_mean_ens) / y_sd_ens
-
-X_train_sc <- Xtr_ens_sc[train_idx, , drop = FALSE]
-y_train_sc <- y_tr_sc[train_idx]
-
-X_val_sc <- Xtr_ens_sc[val_idx, , drop = FALSE]
-y_val    <- y_tr[val_idx]
-
-lower_bound_mc <- min(y_tr, na.rm = TRUE)
-
-mcd_cv_scores <- sapply(seq_len(nrow(mcd_params_test)), function(i) {
-  hp <- mcd_params_test[i, ]
-  
-  cat(sprintf("  [%d/%d] dropout=%.2f lr=%.4g ...",
-              i, nrow(mcd_params_test), hp$dropout_rate, hp$lr))
-  
-  net <- train_dropout_qrnn(
-    X_train_sc, y_train_sc,
-    dropout_rate = hp$dropout_rate,
-    lr = hp$lr,
-    epochs = epochs_tune,
-    batch_size = batch_size_tune
-  )
-  
-  pred3 <- predict_mcd_key_quantiles(
-    net, X_val_sc,
-    M_pass = M_pass_tune,
-    y_mean = y_mean_ens, y_sd = y_sd_ens,
-    lower_bound = lower_bound_mc
-  )
-  
-  wis_val <- wis_mean_from_pred(pred3, y_val)
-  cat(sprintf(" WIS=%.4f\n", wis_val))
-  wis_val
-})
-
-best_i <- which.min(mcd_cv_scores)
-best_mcd_params <- as.list(mcd_params_test[best_i, ])
-cat("\n✓ Best MCD params:\n")
-print(best_mcd_params)
-cat("✓ Best WIS:", round(mcd_cv_scores[best_i], 4), "\n\n")
-
-# -------------------------
-# 7) Train final MC Dropout model with best params (full epochs)
-# -------------------------
-cat("=== Training FINAL MC Dropout (QRNN) ===\n")
-
-epochs_final     <- 150
-batch_size_final <- 512
-M_dropout        <- 100  # Number of MC samples at test time
-
-# Final train on full training set
-mc_dropout_qrnn <- train_dropout_qrnn(
-  X_train_sc = Xtr_ens_sc,
-  y_train_sc = y_tr_sc,
-  dropout_rate = best_mcd_params$dropout_rate,
-  lr = best_mcd_params$lr,
-  epochs = epochs_final,
-  batch_size = batch_size_final
-)
-
-# -------------------------
-# 8) MC prediction on TEST set: full quantile grid (for CRPS) + key quantiles
-# -------------------------
-cat(sprintf("Generating %d MC samples on test set...\n", M_dropout))
-
+# --- Stage 2: extract features ---
+cat("Stage 2: Extracting 64-dim neural features...\n")
+nn_feat_extractor$eval()
+X_tr_t <- torch_tensor(Xtr_ens_sc, dtype = torch_float(), device = device)
 X_te_t <- torch_tensor(Xte_ens_sc, dtype = torch_float(), device = device)
-
-# Keep dropout ENABLED
-mc_dropout_qrnn$train()
-
-n_te <- nrow(Xte_ens_sc)
-mc_q_samples <- array(0, dim = c(n_te, n_quantiles, M_dropout))
-
 with_no_grad({
-  for (i in seq_len(M_dropout)) {
-    out_sc <- mc_dropout_qrnn(X_te_t)
-    mc_q_samples[, , i] <- as.matrix(out_sc$to(device = "cpu"))
-  }
+  neural_tr <- as.matrix(nn_feat_extractor(X_tr_t))
+  neural_te <- as.matrix(nn_feat_extractor(X_te_t))
 })
+colnames(neural_tr) <- colnames(neural_te) <- paste0("nn_feat_", seq_len(ncol(neural_tr)))
+df_neural_tr <- as.data.frame(neural_tr)
+df_neural_te <- as.data.frame(neural_te)
+cat(sprintf("  Features: %d train x %d dims,  %d test x %d dims\n",
+            nrow(df_neural_tr), ncol(df_neural_tr), nrow(df_neural_te), ncol(df_neural_te)))
 
-# Aggregate: average quantiles across MC samples
-mcd_q_sc  <- apply(mc_q_samples, c(1, 2), mean)
-
-# Back-transform
-mcd_q_all <- mcd_q_sc * y_sd_ens + y_mean_ens
-
-# Enforce monotonicity + lower bound
-mcd_q_all <- t(apply(mcd_q_all, 1, sort))
-mcd_q_all <- pmax(mcd_q_all, lower_bound_mc)
-
-# Key quantiles
-mcd_q <- data.frame(
-  q05 = mcd_q_all[, q05_idx],
-  q50 = mcd_q_all[, q50_idx],
-  q95 = mcd_q_all[, q95_idx]
+# --- Stage 3: DRF on neural features ---
+cat("Stage 3: Training DRF on neural features...\n")
+hybrid_drf <- drf(
+  X               = df_neural_tr,
+  Y               = y_tr,
+  num.trees       = 1000,
+  min.node.size   = 50,
+  mtry            = floor(sqrt(ncol(df_neural_tr))),
+  sample.fraction = 0.5,
+  seed            = 2026
 )
 
-# Dense quantile grid (for CRPS etc.)
-mcd_qgrid <- as.data.frame(mcd_q_all)
-colnames(mcd_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
+# --- Stage 4: predict ---
+cat("Stage 4: Computing Hybrid predictions (wquant_matrix)...\n")
+hybrid_pred   <- predict(hybrid_drf, newdata = df_neural_te)
+hybrid_qgrid_mat <- wquant_matrix(as.numeric(hybrid_pred$y), hybrid_pred$weights, q_grid)
+lower_hyb     <- min(y_tr)
+hybrid_qgrid_mat <- pmax(hybrid_qgrid_mat, lower_hyb)
 
-cat("MC Dropout (QRNN) fine-tuned training complete.\n\n")
+hybrid_q      <- data.frame(q05 = hybrid_qgrid_mat[, q05_idx],
+                            q50 = hybrid_qgrid_mat[, q50_idx],
+                            q95 = hybrid_qgrid_mat[, q95_idx])
+hybrid_qgrid  <- as.data.frame(hybrid_qgrid_mat)
+colnames(hybrid_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
+cat("Hybrid NN+DRF complete.\n\n")
 
 
-# ========================================
-# SUMMARY: Save All Best Parameters
-# ========================================
-
+# ============================================================
+# SAVE BEST HYPERPARAMETERS
+# ============================================================
 best_hyperparameters <- list(
-  DRF = list(
-    num.trees = num_trees_drf, 
-    min.node.size = min_node_size_drf
-  ),
-  QRF = list(ntree = ntree_qrf, nodesize = nodesize_qrf),
-  Ranger = list(num.trees = num_trees_ranger, min.node.size = min_node_size_ranger),
-  XGBoost = list(max_depth = max_depth_xgb, eta = eta_xgb, nrounds = nrounds_xgb),
-  ENS = best_ens_params,
-  MCD = best_mcd_params
+  DRF          = list(num.trees = num_trees_drf,    min.node.size = min_node_size_drf),
+  QRF          = list(ntree = ntree_qrf,            nodesize = nodesize_qrf),
+  Ranger       = list(num.trees = num_trees_ranger, min.node.size = min_node_size_ranger),
+  XGBoost      = list(max_depth = max_depth_xgb,   eta = eta_xgb, nrounds = nrounds_xgb),
+  ENS_Gamma    = best_ens_hp,
+  MCD_Gamma    = best_mcd_hp,
+  DDNN_Gamma   = best_ddnn_hp,
+  Ensemble_DRF = list(B = B_edrf, num.trees = num_trees_drf, min.node.size = min_node_size_drf),
+  BNN_Gamma    = best_bnn_hp
 )
 
-# evaluation
-# Evaluate prediction interval performance
+
+# ============================================================
+# UNIFIED EVALUATION (all 10 models)
+# ============================================================
+cat("\n========================================\n")
+cat("UNIFIED EVALUATION — ALL MODELS\n")
+cat("========================================\n\n")
+
+# --- Helper definitions ---
 eval_interval <- function(q, y) {
-  # Indicator whether the true value lies inside the interval
   covered <- (y >= q$q05) & (y <= q$q95)
-  list(
-    # Empirical coverage rate
-    coverage = mean(covered),
-    # Average interval width
-    width    = mean(q$q95 - q$q05)
-  )
+  list(coverage = mean(covered, na.rm = TRUE),
+       width    = mean(q$q95 - q$q05, na.rm = TRUE))
 }
 
-# evaluate our models using the function defined
-res_drf <- eval_interval(drf_q, y_te)
-res_qrf <- eval_interval(qrf_q, y_te)
-res_rf  <- eval_interval(rf_q,  y_te)
-res_xgb <- eval_interval(xgb_q, y_te)
-res_ens <- eval_interval(ens_q, y_te)
-res_mcd <- eval_interval(mcd_q, y_te)
-
-# combine the results as a table
-rbind(
-  DRF = unlist(res_drf),
-  QRF = unlist(res_qrf),
-  RF  = unlist(res_rf),
-  XGB = unlist(res_xgb),
-  ENS = unlist(res_ens),
-  MCD = unlist(res_mcd)
-)
-
-
-# Compute mean Weighted Interval Score
 wis_score <- function(q, y, na.rm = TRUE) {
-  # Extract quantile predictions
-  pred <- as.matrix(q[, c("q05", "q50", "q95")])
-  # Compute WIS using scoringutils
-  scoringutils::wis(
-    observed = y,
-    predicted = pred,
-    quantile_level = c(0.05, 0.5, 0.95),
-    na.rm = na.rm
-  ) |> mean(na.rm = na.rm)
+  pred <- as.matrix(q[, c("q05","q50","q95")])
+  mean(scoringutils::wis(y, pred, c(0.05,0.5,0.95), na.rm = na.rm), na.rm = na.rm)
 }
 
-# compare wis score for our models
-c(
-  DRF = wis_score(drf_q, y_te),
-  QRF = wis_score(qrf_q, y_te),
-  RF  = wis_score(rf_q,  y_te),
-  XGB = wis_score(xgb_q, y_te),
-  ENS = wis_score(ens_q, y_te),
-  MCD = wis_score(mcd_q, y_te)
-)
-
-# --------- Subgroup analysis ----------------#
-
-# Build an evaluation dataframe
-eval_df <- data.frame(
-  # True outcomes on test set
-  y = y_te,
-  # DRF predicted quantiles
-  drf_q05 = drf_q$q05,
-  drf_q50 = drf_q$q50,
-  drf_q95 = drf_q$q95,
-  # QRF predicted quantiles
-  qrf_q05 = qrf_q$q05,
-  qrf_q50 = qrf_q$q50,
-  qrf_q95 = qrf_q$q95,
-  # Random Forest (quantile) predicted quantiles
-  rf_q05  = rf_q$q05,
-  rf_q50  = rf_q$q50,
-  rf_q95  = rf_q$q95,
-  # XGBoost + conformal predicted quantiles/interval endpoints
-  xgb_q05 = xgb_q$q05,
-  xgb_q50 = xgb_q$q50,
-  xgb_q95 = xgb_q$q95,
-  # Deep Ensembles predicted quantiles
-  ens_q05 = ens_q$q05,
-  ens_q50 = ens_q$q50,
-  ens_q95 = ens_q$q95,
-  # MC Dropout predicted quantiles
-  mcd_q05 = mcd_q$q05,
-  mcd_q50 = mcd_q$q50,
-  mcd_q95 = mcd_q$q95
-)
-# Subgroup 1: group by outcome (LOS) ranges
-eval_df$los_group <- cut(
-  eval_df$y,
-  breaks = c(-Inf, 3, 7, Inf),
-  labels = c("Short (≤3d)", "Medium (3–7d)", "Long (>7d)")
-)
-
-# Use Xte_tree (the version that allows NA) to compute miss_rate）
-miss_mat <- is.na(Xte_tree)
-
-# Row-wise missing rate: proportion of NA in each test row
-eval_df$miss_rate <- rowMeans(miss_mat)
-
-# Subgroup 2: group by missingness into terciles (low/mid/high)
-eval_df$miss_group <- cut(
-  eval_df$miss_rate,
-  breaks = quantile(eval_df$miss_rate, probs = c(0, 1/3, 2/3, 1)),
-  labels = c("Low missing", "Mid missing", "High missing"),
-  include.lowest = TRUE
-)
-
-# Subgroup 3: ventilation status (binary)
-eval_df$vent_group <- factor(
-  Xte_tree$vent_any,
-  levels = c(0, 1),
-  labels = c("No ventilation", "Ventilated")
-)
-
-# Subgroup 4: vasopressors status (binary)
-eval_df$vaso_group <- factor(
-  Xte_tree$vasopressors,
-  levels = c(0, 1),
-  labels = c("No vasopressors", "Vasopressors")
-)
-
-# Helper: compute coverage, width, and number of valid cases
-eval_metrics_vec <- function(q05, q95, y) {
-  # Indicator: whether y is inside [q05, q95]
-  covered <- (y >= q05) & (y <= q95)
-  tibble(
-    # Empirical coverage = mean of indicator
-    coverage = mean(covered, na.rm = TRUE),
-    # Average interval width
-    width    = mean(q95 - q05, na.rm = TRUE),
-    # Number of observations used (non-missing covered)
-    n_used   = sum(!is.na(covered))
-  )
+pinball_fn <- function(y, q, tau) {
+  u <- y - q; ifelse(u >= 0, tau * u, (tau - 1) * u)
 }
-
-# Evaluate interval metrics by missingness subgroup, for each model
-out_miss_long <- eval_df %>%
-  group_by(miss_group) %>%
-  summarise(
-    n_group = n(),
-    # For each model, compute interval metrics and store as a list-column
-    DRF = list(eval_metrics_vec(.data$drf_q05, .data$drf_q95, .data$y)),
-    QRF = list(eval_metrics_vec(.data$qrf_q05, .data$qrf_q95, .data$y)),
-    RF  = list(eval_metrics_vec(.data$rf_q05,  .data$rf_q95,  .data$y)),
-    XGB = list(eval_metrics_vec(.data$xgb_q05, .data$xgb_q95, .data$y)),
-    ENS = list(eval_metrics_vec(.data$ens_q05, .data$ens_q95, .data$y)),
-    MCD = list(eval_metrics_vec(.data$mcd_q05, .data$mcd_q95, .data$y)),
-    .groups = "drop"
-  ) %>%
-  # Convert wide model columns into long format
-  pivot_longer(cols = c(DRF, QRF, RF, XGB, ENS, MCD), names_to = "model", values_to = "metrics") %>%
-  # Expand the tibble stored in list-column
-  unnest(metrics)
-
-# show the result
-out_miss_long
-
-
-# Helper: compute mean WIS for one model within a subgroup
-wis_one <- function(y, q05, q50, q95) {
-  # Build predicted quantiles matrix: each row is one case, columns are (q05,q50,q95)
-  pred <- cbind(q05, q50, q95)
-  qs   <- c(0.05, 0.5, 0.95)
-  # scoringutils::wis returns a vector of WIS values (one per observation)
-  mean(scoringutils::wis(
-    observed = y,
-    predicted = pred,
-    quantile_level = qs,
-    na.rm = TRUE
-  ))
-}
-# Evaluate WIS by missingness subgroup for each model
-out_miss_wis <- eval_df %>%
-  group_by(miss_group) %>%
-  summarise(
-    DRF = wis_one(y, drf_q05, drf_q50, drf_q95),
-    QRF = wis_one(y, qrf_q05, qrf_q50, qrf_q95),
-    RF  = wis_one(y, rf_q05,  rf_q50,  rf_q95),
-    XGB = wis_one(y, xgb_q05, xgb_q50, xgb_q95),
-    ENS = wis_one(y, ens_q05, ens_q50, ens_q95),
-    MCD = wis_one(y, mcd_q05, mcd_q50, mcd_q95),
-    .groups = "drop"
-  ) %>%
-  pivot_longer(-miss_group, names_to = "model", values_to = "WIS")
-
-out_miss_wis
-
-# group by ventilation / vasopressors
-# Evaluate interval metrics within ventilation subgroups
-out_vent_long <- eval_df %>%
-  group_by(vent_group) %>%
-  summarise(
-    n_group = n(),
-    # Compute coverage and width for each model
-    DRF = list(eval_metrics_vec(drf_q05, drf_q95, y)),
-    QRF = list(eval_metrics_vec(qrf_q05, qrf_q95, y)),
-    RF  = list(eval_metrics_vec(rf_q05,  rf_q95,  y)),
-    XGB = list(eval_metrics_vec(xgb_q05, xgb_q95, y)),
-    ENS = list(eval_metrics_vec(ens_q05, ens_q95, y)),
-    MCD = list(eval_metrics_vec(mcd_q05, mcd_q95, y)),
-    .groups = "drop"
-  ) %>%
-  pivot_longer(cols = c(DRF, QRF, RF, XGB, ENS, MCD),
-               names_to = "model",
-               values_to = "metrics") %>%
-  # Expand list-column into separate columns
-  unnest(metrics)
-
-out_vent_long
-# Compute subgroup-specific WIS by ventilation status
-out_vent_wis <- eval_df %>%
-  group_by(vent_group) %>%
-  summarise(
-    DRF = wis_one(y, drf_q05, drf_q50, drf_q95),
-    QRF = wis_one(y, qrf_q05, qrf_q50, qrf_q95),
-    RF  = wis_one(y, rf_q05,  rf_q50,  rf_q95),
-    XGB = wis_one(y, xgb_q05, xgb_q50, xgb_q95),
-    ENS = wis_one(y, ens_q05, ens_q50, ens_q95),
-    MCD = wis_one(y, mcd_q05, mcd_q50, mcd_q95),
-    .groups = "drop"
-  ) %>%
-  pivot_longer(-vent_group, names_to = "model", values_to = "WIS")
-
-out_vent_wis
-
-# Compute subgroup-specific WIS by vasopressor status
-out_vaso_wis <- eval_df %>%
-  group_by(vaso_group) %>%
-  summarise(
-    DRF = wis_one(y, drf_q05, drf_q50, drf_q95),
-    QRF = wis_one(y, qrf_q05, qrf_q50, qrf_q95),
-    RF  = wis_one(y, rf_q05,  rf_q50,  rf_q95),
-    XGB = wis_one(y, xgb_q05, xgb_q50, xgb_q95),
-    ENS = wis_one(y, ens_q05, ens_q50, ens_q95),
-    MCD = wis_one(y, mcd_q05, mcd_q50, mcd_q95),
-    .groups = "drop"
-  ) %>%
-  pivot_longer(-vaso_group, names_to = "model", values_to = "WIS")
-
-out_vaso_wis
-
-# -------- multi-subgroup test ---------#
-
-# Restrict analysis to the high-missingness subgroup
-eval_hm <- eval_df %>%
-  filter(miss_group == "High missing") %>%
-  # Compute interval width as a proxy for predictive uncertainty
-  mutate(
-    drf_w = drf_q95 - drf_q05,
-    qrf_w = qrf_q95 - qrf_q05,
-    rf_w  = rf_q95  - rf_q05,
-    xgb_w = xgb_q95 - xgb_q05,
-    ens_w = ens_q95 - ens_q05,
-    mcd_w = mcd_q95 - mcd_q05
-  ) %>%
-  # Split each model's predictions into high vs low uncertainty 
-  # based on interval width (median split)
-  mutate(
-    drf_uncert = ifelse(ntile(drf_w, 2) == 2, "High uncertainty", "Low uncertainty"),
-    qrf_uncert = ifelse(ntile(qrf_w, 2) == 2, "High uncertainty", "Low uncertainty"),
-    rf_uncert  = ifelse(ntile(rf_w,  2) == 2, "High uncertainty", "Low uncertainty"),
-    xgb_uncert = ifelse(ntile(xgb_w, 2) == 2, "High uncertainty", "Low uncertainty"),
-    ens_uncert = ifelse(ntile(ens_w, 2) == 2, "High uncertainty", "Low uncertainty"),
-    mcd_uncert = ifelse(ntile(mcd_w, 2) == 2, "High uncertainty", "Low uncertainty")
-  )
-
-# calculate the sample size, sanity check
-table(eval_hm$drf_uncert)
-table(eval_hm$qrf_uncert)
-table(eval_hm$rf_uncert)
-table(eval_hm$xgb_uncert)
-table(eval_hm$ens_uncert)
-table(eval_hm$mcd_uncert)
-
-# build a function to compute mean WIS on a subset defined by idx
-wis_subset <- function(y, q05, q50, q95, idx) {
-  pred <- cbind(q05[idx], q50[idx], q95[idx])
-  qs   <- c(0.05, 0.5, 0.95)
-  mean(scoringutils::wis(
-    observed = y[idx],
-    predicted = pred,
-    quantile_level = qs,
-    na.rm = TRUE
-  ))
-}
-
-# apply the function to calculate wis for each model in different uncertainty risk
-out_uncert_wis <- eval_hm %>%
-  summarise(
-    DRF_low  = wis_subset(y, drf_q05, drf_q50, drf_q95, drf_uncert=="Low uncertainty"),
-    DRF_high = wis_subset(y, drf_q05, drf_q50, drf_q95, drf_uncert=="High uncertainty"),
-    
-    QRF_low  = wis_subset(y, qrf_q05, qrf_q50, qrf_q95, qrf_uncert=="Low uncertainty"),
-    QRF_high = wis_subset(y, qrf_q05, qrf_q50, qrf_q95, qrf_uncert=="High uncertainty"),
-    
-    RF_low   = wis_subset(y, rf_q05,  rf_q50,  rf_q95,  rf_uncert=="Low uncertainty"),
-    RF_high  = wis_subset(y, rf_q05,  rf_q50,  rf_q95,  rf_uncert=="High uncertainty"),
-    
-    XGB_low  = wis_subset(y, xgb_q05, xgb_q50, xgb_q95, xgb_uncert=="Low uncertainty"),
-    XGB_high = wis_subset(y, xgb_q05, xgb_q50, xgb_q95, xgb_uncert=="High uncertainty"),
-    
-    ENS_low  = wis_subset(y, ens_q05, ens_q50, ens_q95, ens_uncert=="Low uncertainty"),
-    ENS_high = wis_subset(y, ens_q05, ens_q50, ens_q95, ens_uncert=="High uncertainty"),
-    
-    MCD_low  = wis_subset(y, mcd_q05, mcd_q50, mcd_q95, mcd_uncert=="Low uncertainty"),
-    MCD_high = wis_subset(y, mcd_q05, mcd_q50, mcd_q95, mcd_uncert=="High uncertainty")
-  ) %>%
-  pivot_longer(
-    everything(),
-    names_to = c("model","uncert"),
-    names_sep = "_",
-    values_to = "WIS"
-  )
-
-out_uncert_wis
-# compute the number of each group
-out_uncert_n <- tibble(
-  model = c("DRF","QRF","RF","XGB","ENS","MCD"),
-  low_n  = c(sum(eval_hm$drf_uncert=="Low uncertainty"),
-             sum(eval_hm$qrf_uncert=="Low uncertainty"),
-             sum(eval_hm$rf_uncert=="Low uncertainty"),
-             sum(eval_hm$xgb_uncert=="Low uncertainty"),
-             sum(eval_hm$ens_uncert=="Low uncertainty"),
-             sum(eval_hm$mcd_uncert=="Low uncertainty")),
-  high_n = c(sum(eval_hm$drf_uncert=="High uncertainty"),
-             sum(eval_hm$qrf_uncert=="High uncertainty"),
-             sum(eval_hm$rf_uncert=="High uncertainty"),
-             sum(eval_hm$xgb_uncert=="High uncertainty"),
-             sum(eval_hm$ens_uncert=="High uncertainty"),
-             sum(eval_hm$mcd_uncert=="High uncertainty"))
-)
-
-out_uncert_n
-
-# Compute coverage and interval width on subset idx
-cov_width_subset <- function(y, q05, q95, idx) {
-  covered <- (y[idx] >= q05[idx]) & (y[idx] <= q95[idx])
-  tibble(
-    coverage = mean(covered, na.rm = TRUE),
-    width    = mean(q95[idx] - q05[idx], na.rm = TRUE),
-    n        = sum(idx)
-  )
-}
-
-# combine all the results
-out_uncert_cov <- bind_rows(
-  
-  # DRF
-  cov_width_subset(eval_hm$y, eval_hm$drf_q05, eval_hm$drf_q95,
-                   eval_hm$drf_uncert == "Low uncertainty") %>%
-    mutate(model = "DRF", uncert = "Low"),
-  
-  cov_width_subset(eval_hm$y, eval_hm$drf_q05, eval_hm$drf_q95,
-                   eval_hm$drf_uncert == "High uncertainty") %>%
-    mutate(model = "DRF", uncert = "High"),
-  
-  # QRF
-  cov_width_subset(eval_hm$y, eval_hm$qrf_q05, eval_hm$qrf_q95,
-                   eval_hm$qrf_uncert == "Low uncertainty") %>%
-    mutate(model = "QRF", uncert = "Low"),
-  
-  cov_width_subset(eval_hm$y, eval_hm$qrf_q05, eval_hm$qrf_q95,
-                   eval_hm$qrf_uncert == "High uncertainty") %>%
-    mutate(model = "QRF", uncert = "High"),
-  
-  # RF
-  cov_width_subset(eval_hm$y, eval_hm$rf_q05, eval_hm$rf_q95,
-                   eval_hm$rf_uncert == "Low uncertainty") %>%
-    mutate(model = "RF", uncert = "Low"),
-  
-  cov_width_subset(eval_hm$y, eval_hm$rf_q05, eval_hm$rf_q95,
-                   eval_hm$rf_uncert == "High uncertainty") %>%
-    mutate(model = "RF", uncert = "High"),
-  
-  # XGB
-  cov_width_subset(eval_hm$y, eval_hm$xgb_q05, eval_hm$xgb_q95,
-                   eval_hm$xgb_uncert == "Low uncertainty") %>%
-    mutate(model = "XGB", uncert = "Low"),
-  
-  cov_width_subset(eval_hm$y, eval_hm$xgb_q05, eval_hm$xgb_q95,
-                   eval_hm$xgb_uncert == "High uncertainty") %>%
-    mutate(model = "XGB", uncert = "High"),
-  
-  # ENS
-  cov_width_subset(eval_hm$y, eval_hm$ens_q05, eval_hm$ens_q95,
-                   eval_hm$ens_uncert == "Low uncertainty") %>%
-    mutate(model = "ENS", uncert = "Low"),
-  
-  cov_width_subset(eval_hm$y, eval_hm$ens_q05, eval_hm$ens_q95,
-                   eval_hm$ens_uncert == "High uncertainty") %>%
-    mutate(model = "ENS", uncert = "High"),
-  
-  # MCD
-  cov_width_subset(eval_hm$y, eval_hm$mcd_q05, eval_hm$mcd_q95,
-                   eval_hm$mcd_uncert == "Low uncertainty") %>%
-    mutate(model = "MCD", uncert = "Low"),
-  
-  cov_width_subset(eval_hm$y, eval_hm$mcd_q05, eval_hm$mcd_q95,
-                   eval_hm$mcd_uncert == "High uncertainty") %>%
-    mutate(model = "MCD", uncert = "High")
-  
-)
-
-out_uncert_cov
-
-# draw the plot for the results
-library(ggplot2)
-ggplot(out_uncert_cov, aes(x = uncert, y = coverage, color = model, group = model)) +
-  geom_line(linewidth = 0.9) +
-  geom_point(size = 2) +
-  geom_hline(yintercept = 0.90, linetype = "dashed", color = "red") +
-  theme_bw(base_size = 12) +
-  labs(
-    title = "Coverage under High Missingness",
-    subtitle = "Stratified by model-predicted uncertainty",
-    x = "Predicted uncertainty stratum",
-    y = "Empirical Coverage"
-  )
-
-ggplot(out_uncert_cov, aes(x = uncert, y = width, color = model, group = model)) +
-  geom_line(linewidth = 0.9) +
-  geom_point(size = 2) +
-  theme_bw(base_size = 12) +
-  labs(
-    title = "Interval Width under High Missingness",
-    x = "Predicted uncertainty stratum",
-    y = "Average Interval Width"
-  )
-
-# ----- conditional calibration ----------#
-
-# ----------------------------
-# Build cal_df for conditional calibration
-# ----------------------------
-
-K<- 10  # number of bins
-
-# ----------------------------
-# Build cal_df safely
-# ----------------------------
-
-cal_df <- bind_rows(
-  
-  # DRF
-  eval_df %>%
-    transmute(
-      model = "DRF",
-      y,
-      q05 = drf_q05,
-      q50 = drf_q50,
-      q95 = drf_q95
-    ),
-  
-  # QRF
-  eval_df %>%
-    transmute(
-      model = "QRF",
-      y,
-      q05 = qrf_q05,
-      q50 = qrf_q50,
-      q95 = qrf_q95
-    ),
-  
-  # RF
-  eval_df %>%
-    transmute(
-      model = "RF",
-      y,
-      q05 = rf_q05,
-      q50 = rf_q50,
-      q95 = rf_q95
-    ),
-  
-  # XGB
-  eval_df %>%
-    transmute(
-      model = "XGB",
-      y,
-      q05 = xgb_q05,
-      q50 = xgb_q50,
-      q95 = xgb_q95
-    ),
-  
-  # ENS
-  eval_df %>%
-    transmute(
-      model = "ENS",
-      y,
-      q05 = ens_q05,
-      q50 = ens_q50,
-      q95 = ens_q95
-    ),
-  
-  # MCD
-  eval_df %>%
-    transmute(
-      model = "MCD",
-      y,
-      q05 = mcd_q05,
-      q50 = mcd_q50,
-      q95 = mcd_q95
-    )
-  
-) %>%
-  mutate(
-    # predicted median as x-axis
-    x = q50,
-    # coverage indicator
-    covered = (y >= q05) & (y <= q95)
-  ) %>%
-  group_by(model) %>%
-  mutate(
-    # bin by predicted median
-    bin = ntile(x, K)
-  ) %>%
-  group_by(model, bin) %>%
-  summarise(
-    x = mean(x, na.rm = TRUE),
-    coverage = mean(covered, na.rm = TRUE),
-    n_bin = sum(!is.na(covered)),
-    .groups = "drop"
-  )
-
-cal_df_clean <- cal_df %>%
-  mutate(
-    # Standard error of binomial proportion
-    se = sqrt(coverage * (1 - coverage) / n_bin),
-    # 95% confidence interval bounds
-    lower = pmax(0, coverage - 1.96 * se),
-    upper = pmin(1, coverage + 1.96 * se)
-  )
-
-# create the plot for calibration
-ggplot(cal_df_clean, aes(x = x, y = coverage)) +
-  # Draw a dashed red reference line for visual comparison
-  geom_hline(yintercept = 0.90, linetype = "dashed", color = "red", alpha = 0.6) +
-  # Confidence ribbon around empirical coverage
-  # Represents 95% binomial confidence interval
-  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "steelblue", alpha = 0.15) +
-  # Calibration curve (empirical coverage across bins)
-  geom_line(color = "steelblue", size = 0.8) +
-  # Points representing bin-level coverage estimates
-  geom_point(color = "steelblue", size = 1.5, alpha = 0.8) +
-  # Facet by model for side-by-side comparison
-  facet_wrap(~ model, ncol = 2) +
-  # Y-axis formatting as percentage and restrict visible range
-  scale_y_continuous(labels = scales::percent, limits = c(0.6, 1.0)) +
-  # Labels and title
-  labs(
-    title = "Conditional Calibration of 90% Prediction Intervals",
-    subtitle = "Assessing coverage stability across different LOS risk levels",
-    x = "Predicted Median LOS (Days)",
-    y = "Empirical Coverage (%)"
-  ) +
-  # Clean theme
-  theme_bw(base_size = 12) +
-  theme(
-    strip.background = element_rect(fill = "#f0f0f0"),
-    panel.grid.minor = element_blank(),
-    plot.title = element_text(face = "bold")
-  )
-
-
-# ---- CRPS evaluation --------#
-
-# pinball loss
-pinball <- function(y, q, tau) {
-  u <- y - q
-  ifelse(u >= 0, tau * u, (tau - 1) * u)
-}
-
-# CRPS 近似：2 * \int pinball d tau （用梯形法）
 crps_from_quantiles <- function(y, qmat, taus) {
-  ord <- order(taus)
-  taus <- taus[ord]
-  qmat <- qmat[, ord, drop = FALSE]
-  
-  # 梯形权重
+  ord   <- order(taus); taus <- taus[ord]; qmat <- qmat[, ord, drop = FALSE]
   w <- numeric(length(taus))
   w[1] <- (taus[2] - taus[1]) / 2
   w[length(taus)] <- (taus[length(taus)] - taus[length(taus)-1]) / 2
-  if (length(taus) > 2) {
-    for (j in 2:(length(taus)-1)) {
-      w[j] <- (taus[j+1] - taus[j-1]) / 2
-    }
-  }
-  
-  # 对每个tau算 pinball，然后按权重积分
+  if (length(taus) > 2)
+    for (j in 2:(length(taus)-1)) w[j] <- (taus[j+1] - taus[j-1]) / 2
   pb <- 0
-  for (j in seq_along(taus)) {
-    pb <- pb + w[j] * pinball(y, qmat[, j], taus[j])
-  }
+  for (j in seq_along(taus)) pb <- pb + w[j] * pinball_fn(y, qmat[, j], taus[j])
   mean(2 * pb, na.rm = TRUE)
 }
 
-
-# ---- CRPS with dense grid (NEW) ----
-crps_all_grid <- c(
-  DRF = crps_from_quantiles(eval_df$y, as.matrix(drf_qgrid), q_grid),
-  QRF = crps_from_quantiles(eval_df$y, as.matrix(qrf_qgrid), q_grid),
-  RF  = crps_from_quantiles(eval_df$y, as.matrix(rf_qgrid),  q_grid),
-  XGB = crps_from_quantiles(eval_df$y, as.matrix(xgb_qgrid), q_grid),
-  ENS = crps_from_quantiles(eval_df$y, as.matrix(ens_qgrid), q_grid),
-  MCD = crps_from_quantiles(eval_df$y, as.matrix(mcd_qgrid), q_grid)
-)
-
-crps_all_grid
-
-
-# ---- NLL (Negative Log-Likelihood) evaluation ----
-# All models now use non-parametric density approximation from quantile grids
-# XGB skipped: conformal prediction does not provide explicit probability density
-
-# Helper: approximate PDF from quantile predictions
-# Given quantiles q at levels tau, approximate f(y) via numerical differentiation of CDF
 approx_density_from_quantiles <- function(y, qmat, taus) {
-  # qmat: n_test x n_quantiles matrix
-  # taus: quantile levels (e.g., 0.05, 0.10, ..., 0.95)
-  # Returns: density estimate for each y
-  
-  n <- length(y)
-  densities <- numeric(n)
-  
+  n   <- length(y); dens <- numeric(n)
   for (i in seq_len(n)) {
-    q_i <- qmat[i, ]  # quantiles for observation i
-    y_i <- y[i]
-    
-    # Find where y_i falls in the quantile grid
-    # CDF(y) is approximated by interpolating tau values
-    if (y_i <= q_i[1]) {
-      # Below first quantile: use left tail approximation
-      # f(y) ≈ delta_tau / delta_q for first interval
-      delta_q <- q_i[2] - q_i[1]
-      delta_tau <- taus[2] - taus[1]
-      if (delta_q > 1e-10) {
-        densities[i] <- delta_tau / delta_q
-      } else {
-        densities[i] <- 1e-6  # numerical floor
-      }
-    } else if (y_i >= q_i[length(q_i)]) {
-      # Above last quantile: use right tail approximation
-      n_q <- length(q_i)
-      delta_q <- q_i[n_q] - q_i[n_q - 1]
-      delta_tau <- taus[n_q] - taus[n_q - 1]
-      if (delta_q > 1e-10) {
-        densities[i] <- delta_tau / delta_q
-      } else {
-        densities[i] <- 1e-6
-      }
+    qi <- qmat[i, ]; yi <- y[i]
+    if (yi <= qi[1]) {
+      dq <- qi[2]-qi[1]; dt <- taus[2]-taus[1]
+      dens[i] <- if (dq > 1e-10) dt/dq else 1e-6
+    } else if (yi >= qi[length(qi)]) {
+      nq <- length(qi); dq <- qi[nq]-qi[nq-1]; dt <- taus[nq]-taus[nq-1]
+      dens[i] <- if (dq > 1e-10) dt/dq else 1e-6
     } else {
-      # Within quantile range: linear interpolation of CDF, then differentiate
-      # Find bracket: q[j] <= y < q[j+1]
-      j <- max(which(q_i <= y_i))
-      
-      if (j < length(q_i)) {
-        # PDF ≈ dF/dy ≈ (tau[j+1] - tau[j]) / (q[j+1] - q[j])
-        delta_q <- q_i[j + 1] - q_i[j]
-        delta_tau <- taus[j + 1] - taus[j]
-        
-        if (delta_q > 1e-10) {
-          densities[i] <- delta_tau / delta_q
-        } else {
-          # quantiles too close: use numerical floor
-          densities[i] <- 1e-6
-        }
-      } else {
-        densities[i] <- 1e-6
-      }
+      j  <- max(which(qi <= yi))
+      dq <- qi[j+1]-qi[j]; dt <- taus[j+1]-taus[j]
+      dens[i] <- if (dq > 1e-10) dt/dq else 1e-6
     }
   }
-  
-  # Ensure positive density with numerical floor
-  pmax(densities, 1e-10)
+  pmax(dens, 1e-10)
 }
 
-# Compute NLL for each model
-cat("\nComputing NLL (Negative Log-Likelihood)...\n")
-
-# DRF: approximate density from quantile grid
-drf_densities <- approx_density_from_quantiles(y_te, as.matrix(drf_qgrid), q_grid)
-nll_drf <- -mean(log(drf_densities))
-
-# QRF: approximate density from quantile grid
-qrf_densities <- approx_density_from_quantiles(y_te, as.matrix(qrf_qgrid), q_grid)
-nll_qrf <- -mean(log(qrf_densities))
-
-# RF: approximate density from quantile grid
-rf_densities <- approx_density_from_quantiles(y_te, as.matrix(rf_qgrid), q_grid)
-nll_rf <- -mean(log(rf_densities))
-
-# ENS: approximate density from quantile grid (now non-parametric)
-ens_densities <- approx_density_from_quantiles(y_te, as.matrix(ens_qgrid), q_grid)
-nll_ens <- -mean(log(ens_densities))
-
-# MCD: approximate density from quantile grid (now non-parametric)
-mcd_densities <- approx_density_from_quantiles(y_te, as.matrix(mcd_qgrid), q_grid)
-nll_mcd <- -mean(log(mcd_densities))
-
-# Combine results (XGB omitted: no explicit density from conformal prediction)
-nll_results <- c(
-  DRF = nll_drf,
-  QRF = nll_qrf,
-  RF  = nll_rf,
-  ENS = nll_ens,
-  MCD = nll_mcd
+# Named list: model label -> prediction data.frame (q05, q50, q95)
+all_q <- list(
+  DRF          = drf_q,
+  QRF          = qrf_q,
+  RF           = rf_q,
+  XGB          = xgb_q,
+  ENS_Gamma    = ens_q,
+  MCD_Gamma    = mcd_q,
+  DDNN_Gamma   = ddnn_q,
+  Ensemble_DRF = edrf_q,
+  BNN_Gamma    = bnn_q,
+  Hybrid_NN_DRF = hybrid_q
 )
-
-cat("\nNLL (lower is better):\n")
-print(round(nll_results, 4))
-
-
-cat("\n=== Generating Test Set Distribution Comparison ===\n")
-
-# ---- Method 1: Histogram + Density Overlay (Most Intuitive) ----
-
-# Prepare data: sample from each model's predictive distribution
-set.seed(2026)
-n_samples_per_patient <- 100  # Draw 100 samples per patient from each model
-
-# Helper: sample from quantile-based distribution
-sample_from_quantiles <- function(qmat, taus, n_samples) {
-  # qmat: n_test x n_quantiles
-  # Returns: n_test x n_samples matrix of sampled values
-  
-  n_test <- nrow(qmat)
-  samples <- matrix(0, nrow = n_test, ncol = n_samples)
-  
-  for (i in seq_len(n_test)) {
-    # Inverse CDF sampling: generate uniform U ~ [0,1], find Q(U)
-    u <- runif(n_samples)
-    
-    # Interpolate quantile function
-    samples[i, ] <- approx(x = taus, y = qmat[i, ], xout = u, rule = 2)$y
-  }
-  
-  samples
-}
-
-# Sample from each model
-cat("Sampling from predictive distributions...\n")
-
-drf_samples <- sample_from_quantiles(as.matrix(drf_qgrid), q_grid, n_samples_per_patient)
-qrf_samples <- sample_from_quantiles(as.matrix(qrf_qgrid), q_grid, n_samples_per_patient)
-rf_samples  <- sample_from_quantiles(as.matrix(rf_qgrid),  q_grid, n_samples_per_patient)
-
-# For quantile-based models: sample using inverse CDF method
-ens_samples <- sample_from_quantiles(as.matrix(ens_qgrid), q_grid, n_samples_per_patient)
-mcd_samples <- sample_from_quantiles(as.matrix(mcd_qgrid), q_grid, n_samples_per_patient)
-
-# Flatten to long format for ggplot
-df_dist <- data.frame(
-  LOS = c(
-    y_te,                         # Actual
-    as.vector(drf_samples),       # DRF
-    as.vector(qrf_samples),       # QRF
-    as.vector(rf_samples),        # RF
-    as.vector(ens_samples),       # ENS
-    as.vector(mcd_samples)        # MCD
-  ),
-  Model = rep(
-    c("Actual", "DRF", "QRF", "RF", "ENS", "MCD"),
-    times = c(length(y_te), rep(length(y_te) * n_samples_per_patient, 5))
-  )
+all_qgrid <- list(
+  DRF          = drf_qgrid,
+  QRF          = qrf_qgrid,
+  RF           = rf_qgrid,
+  XGB          = xgb_qgrid,
+  ENS_Gamma    = ens_qgrid,
+  MCD_Gamma    = mcd_qgrid,
+  DDNN_Gamma   = ddnn_qgrid,
+  Ensemble_DRF = edrf_qgrid,
+  BNN_Gamma    = bnn_qgrid,
+  Hybrid_NN_DRF = hybrid_qgrid
 )
-
-# Remove extreme outliers for better visualization (optional)
-df_dist <- df_dist %>% filter(LOS >= 0, LOS <= quantile(y_te, 0.99) * 1.5)
-
-cat(sprintf("Total samples: %d\n", nrow(df_dist)))
-
-
-# ---- 最终学术期刊风格对比图：分面+背景真值对比 ----
-
-# 1. 数据预处理（复用你之前的 df_dist）
-# 确保 Model 是有序因子，方便排序展示
-df_dist$Model <- factor(df_dist$Model, levels = c("Actual", "DRF", "QRF", "RF", "ENS", "MCD"))
-
-# 创建一个专门用于绘制“背景真值”的数据框，去除 Model 列
-# 这样在 facet_wrap 时，这部分数据会在每个面板中重复出现
-df_actual_bg <- df_dist %>% 
-  filter(Model == "Actual") %>% 
-  select(-Model)
-
-# 2. 绘图
-p_final <- ggplot() +
-  # 第一层：在每个面板背景绘制灰色填充的真实分布 (Actual)
-  geom_density(data = df_actual_bg, aes(x = LOS), 
-               fill = "gray50", color = "gray30", alpha = 0.8, linewidth = 0.5) +
-  
-  # 第二层：绘制各模型自身的预测分布（不包含单独的 Actual 面板，或者让它重叠）
-  # 过滤掉 Actual 组，因为我们只需要展示五个模型的面板
-  geom_density(data = df_dist %>% filter(Model != "Actual"), 
-               aes(x = LOS, color = Model, fill = Model), 
-               alpha = 0.5, linewidth = 0.9) +
-  
-  # 分面设置：一行五个或者两行（这里建议一行5个，水平对比感最强；或者 2x3 包含 Actual）
-  # 我们展示 5 个模型面板
-  facet_wrap(~ Model, ncol = 3) + 
-  
-  # 配色方案：学术常用 Set1 或自定义
-  scale_fill_manual(values = c(
-    "DRF" = "#F4A3A3",        # 更浅红
-    "QRF" = "#A8C5E5",        # 更浅蓝
-    "RF"  = "#B7E3B0",        # 更浅绿
-    "ENS" = "#984EA3", 
-    "MCD" = "#FF7F00"
-  )) +
-  
-  scale_color_manual(values = c(
-    "DRF" = "#D65C5C",        # 中等红
-    "QRF" = "#5A9BD4",        # 中等蓝
-    "RF"  = "#66BB66",        # 中等绿
-    "ENS" = "#7A3E82", 
-    "MCD" = "#CC6600"
-  )) +
-  
-  # 坐标轴限制（根据 LOS 分布自动优化，建议展示 95% 分位数区间）
-  coord_cartesian(xlim = c(0, quantile(y_te, 0.95) * 1.3)) +
-  
-  # 学术主题优化
-  theme_bw(base_size = 14) +
-  labs(
-    title = "Comparison of Predictive Distributions against Actual LOS",
-    subtitle = "Gray shaded area represents the actual LOS distribution in all panels",
-    x = "Length of Stay (Days)",
-    y = "Density",
-    caption = "Note: Non-parametric models (top) show superior tail-capture compared to Gaussian models (bottom)."
-  ) +
-  theme(
-    strip.background = element_rect(fill = "gray95", color = "gray80"), # 修改标题背景
-    strip.text = element_text(face = "bold", size = 12),
-    panel.grid.minor = element_blank(),
-    panel.grid.major.x = element_blank(), # 减少纵向线条，干扰视线
-    legend.position = "none", # 因为标题已经说明了模型，不需要图例
-    plot.title = element_text(face = "bold", size = 16, hjust = 0),
-    plot.subtitle = element_text(color = "gray30", size = 12),
-    axis.title = element_text(face = "bold")
-  )
-
-# 显示
-print(p_final)
-
-# 保存为高分辨率 PDF (期刊投稿首选) 或 PNG
-ggsave("/mnt/user-data/outputs/academic_dist_comparison.png", 
-       plot = p_final, width = 12, height = 7, dpi = 600)
-
-
-# ---- Quantitative Assessment: KL Divergence & KS Distance ----
-# Use Kernel Density Estimation instead of histograms for robustness
-
-cat("\n=== Quantitative Distribution Comparison ===\n")
-
-# Helper: Approximate KL divergence using kernel density estimates
-kl_divergence_kde <- function(x_true, x_pred, n_grid = 200) {
-  # Use common grid that spans both distributions
-  x_min <- min(c(x_true, x_pred), na.rm = TRUE)
-  x_max <- max(c(x_true, x_pred), na.rm = TRUE)
-  grid <- seq(x_min, x_max, length.out = n_grid)
-  
-  # Estimate densities using KDE
-  dens_true <- density(x_true, from = x_min, to = x_max, n = n_grid, na.rm = TRUE)
-  dens_pred <- density(x_pred, from = x_min, to = x_max, n = n_grid, na.rm = TRUE)
-  
-  # Get density values
-  p <- dens_true$y
-  q <- dens_pred$y
-  
-  # Add small epsilon to avoid log(0)
-  eps <- 1e-10
-  p <- pmax(p, eps)
-  q <- pmax(q, eps)
-  
-  # Normalize to ensure they sum to 1
-  p <- p / sum(p)
-  q <- q / sum(q)
-  
-  # Compute KL divergence: sum(p * log(p/q))
-  kl <- sum(p * log(p / q), na.rm = TRUE)
-  
-  return(kl)
-}
-
-# Compute KL divergence for each model
-cat("Computing KL divergence (this may take a moment)...\n")
-
-kl_results <- c(
-  DRF = kl_divergence_kde(y_te, as.vector(drf_samples)),
-  QRF = kl_divergence_kde(y_te, as.vector(qrf_samples)),
-  RF  = kl_divergence_kde(y_te, as.vector(rf_samples)),
-  ENS = kl_divergence_kde(y_te, as.vector(ens_samples)),
-  MCD = kl_divergence_kde(y_te, as.vector(mcd_samples))
-)
-
-cat("\nKL Divergence D_KL(P_actual || P_model) [lower is better]:\n")
-print(round(kl_results, 4))
-
-cat("\nBest distributional fit (lowest KL):", names(which.min(kl_results)), "\n")
-
-
-# ---- Statistical Tests ----
-# Kolmogorov-Smirnov test: compare empirical CDFs
-
-ks_drf <- ks.test(y_te, as.vector(drf_samples))$statistic
-ks_qrf <- ks.test(y_te, as.vector(qrf_samples))$statistic
-ks_rf  <- ks.test(y_te, as.vector(rf_samples))$statistic
-ks_ens <- ks.test(y_te, as.vector(ens_samples))$statistic
-ks_mcd <- ks.test(y_te, as.vector(mcd_samples))$statistic
-
-ks_results <- c(
-  DRF = ks_drf,
-  QRF = ks_qrf,
-  RF  = ks_rf,
-  ENS = ks_ens,
-  MCD = ks_mcd
-)
-
-cat("\nKolmogorov-Smirnov Distance [lower is better]:\n")
-print(round(ks_results, 4))
-
-cat("\nBest CDF match (lowest KS):", names(which.min(ks_results)), "\n")
-
-
-# ---- Summary Table ----
-summary_table <- data.frame(
-  Model = c("DRF", "QRF", "RF", "ENS", "MCD"),
-  NLL = round(nll_results, 4),
-  KL_Divergence = round(kl_results, 4),
-  KS_Distance = round(ks_results, 4)
-)
-
-cat("\n=== Summary: Distribution Fit Metrics ===\n")
-print(summary_table)
-
-cat("\n✓ All plots saved to /mnt/user-data/outputs/\n")
-cat("✓ Recommended for publication: distribution_comparison_density.png\n")
-
-
-# ---------- plot CRPS results -------------#
-library(scales)
-
-alpha_target <- 0.90   # 你的区间是 90% (0.05~0.95)
-
-# ---- 1) 组织成长表：每行=一个 test 样本 + 一个模型 ----
-cover_width_long <- eval_df %>%
-  transmute(
-    y,
-    # DRF
-    drf_q05, drf_q95,
-    # QRF
-    qrf_q05, qrf_q95,
-    # RF
-    rf_q05,  rf_q95,
-    # XGB
-    xgb_q05, xgb_q95,
-    # ENS
-    ens_q05, ens_q95,
-    # MCD
-    mcd_q05, mcd_q95
-  ) %>%
-  mutate(
-    drf_w = drf_q95 - drf_q05,
-    qrf_w = qrf_q95 - qrf_q05,
-    rf_w  = rf_q95  - rf_q05,
-    xgb_w = xgb_q95 - xgb_q05,
-    ens_w = ens_q95 - ens_q05,
-    mcd_w = mcd_q95 - mcd_q05,
-    
-    drf_cov = as.integer(y >= drf_q05 & y <= drf_q95),
-    qrf_cov = as.integer(y >= qrf_q05 & y <= qrf_q95),
-    rf_cov  = as.integer(y >= rf_q05  & y <= rf_q95),
-    xgb_cov = as.integer(y >= xgb_q05 & y <= xgb_q95),
-    ens_cov = as.integer(y >= ens_q05 & y <= ens_q95),
-    mcd_cov = as.integer(y >= mcd_q05 & y <= mcd_q95)
-  ) %>%
-  select(
-    y,
-    drf_w, drf_cov,
-    qrf_w, qrf_cov,
-    rf_w,  rf_cov,
-    xgb_w, xgb_cov,
-    ens_w, ens_cov,
-    mcd_w, mcd_cov
-  ) %>%
-  pivot_longer(
-    cols = -y,
-    names_to = c("model", ".value"),
-    names_pattern = "^(drf|qrf|rf|xgb|ens|mcd)_(w|cov)$"
-  ) %>%
-  mutate(
-    model = recode(model,
-                   drf = "DRF", qrf = "QRF", rf = "RF", xgb = "XGB", ens = "ENS", mcd = "MCD")
-  ) %>%
-  filter(is.finite(w), w >= 0)   # 去掉异常宽度
-
-# 看一下是否合理
-summary(cover_width_long$w)
-table(cover_width_long$model)
-
-
-n_bins <- 10
-
-cal_w_df <- cover_width_long %>%
-  group_by(model) %>%
-  mutate(
-    w_bin = ntile(w, n_bins)   # 每个模型各自按 width 分位数分箱（更公平）
-  ) %>%
-  group_by(model, w_bin) %>%
-  summarise(
-    n_bin = n(),
-    x = median(w, na.rm = TRUE),              # 你也可以改成 mean(w)
-    coverage = mean(cov, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    # 二项分布近似标准误 (Wald CI)
-    se = sqrt(coverage * (1 - coverage) / n_bin),
-    lower = pmax(0, coverage - 1.96 * se),
-    upper = pmin(1, coverage + 1.96 * se)
-  )
-
-p_cov_vs_width <- ggplot(cal_w_df, aes(x = x, y = coverage)) +
-  geom_hline(yintercept = alpha_target, linetype = "dashed",
-             linewidth = 0.8, alpha = 0.7) +
-  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15) +
-  geom_line(linewidth = 0.9) +
-  geom_point(size = 2, alpha = 0.85) +
-  facet_wrap(~ model, ncol = 2, scales = "free_x") +
-  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
-  labs(
-    title = "Coverage vs Predicted Interval Width (90% PI)",
-    subtitle = "Do wider (more uncertain) predictions achieve more reliable empirical coverage?",
-    x = "Predicted interval width  (w = q95 - q05)  [bin median]",
-    y = "Empirical coverage within bin"
-  ) +
-  theme_bw(base_size = 12) +
-  theme(
-    strip.background = element_rect(fill = "#f2f2f2"),
-    panel.grid.minor = element_blank(),
-    plot.title = element_text(face = "bold")
-  )
-
-p_cov_vs_width
-
-
-# --------- conditional calibration heatmap --------#
-
-library(scales)
-# nominal target coverage level (90%)
-alpha_target <- 0.90
-
-# Keep only outcome and predicted quantiles for each model
-long2d <- eval_df %>%
-  transmute(
-    y,
-    
-    drf_q05, drf_q50, drf_q95,
-    qrf_q05, qrf_q50, qrf_q95,
-    rf_q05,  rf_q50,  rf_q95,
-    xgb_q05, xgb_q50, xgb_q95,
-    ens_q05, ens_q50, ens_q95,
-    mcd_q05, mcd_q50, mcd_q95
-  ) %>%
-  # Compute interval width (uncertainty proxy)
-  mutate(
-    drf_w = drf_q95 - drf_q05,
-    qrf_w = qrf_q95 - qrf_q05,
-    rf_w  = rf_q95  - rf_q05,
-    xgb_w = xgb_q95 - xgb_q05,
-    ens_w = ens_q95 - ens_q05,
-    mcd_w = mcd_q95 - mcd_q05,
-    # Compute coverage indicator (1 = covered, 0 = not covered)
-    drf_cov = as.integer(y >= drf_q05 & y <= drf_q95),
-    qrf_cov = as.integer(y >= qrf_q05 & y <= qrf_q95),
-    rf_cov  = as.integer(y >= rf_q05  & y <= rf_q95),
-    xgb_cov = as.integer(y >= xgb_q05 & y <= xgb_q95),
-    ens_cov = as.integer(y >= ens_q05 & y <= ens_q95),
-    mcd_cov = as.integer(y >= mcd_q05 & y <= mcd_q95)
-  ) %>%
-  select(
-    y,
-    drf_q50, drf_w, drf_cov,
-    qrf_q50, qrf_w, qrf_cov,
-    rf_q50,  rf_w,  rf_cov,
-    xgb_q50, xgb_w, xgb_cov,
-    ens_q50, ens_w, ens_cov,
-    mcd_q50, mcd_w, mcd_cov
-  ) %>%
-  pivot_longer(
-    cols = -y,
-    names_to = c("model", ".value"),
-    names_pattern = "^(drf|qrf|rf|xgb|ens|mcd)_(q50|w|cov)$"
-  ) %>%
-  mutate(
-    model = recode(model, drf="DRF", qrf="QRF", rf="RF", xgb="XGB", ens="ENS", mcd="MCD")
-  ) %>%
-  filter(is.finite(q50), is.finite(w), w >= 0)
-
-# Define number of bins for predicted risk and predicted uncertainty
-n_risk_bins <- 10
-n_w_bins    <- 10
-# Within each model: Bin by predicted median and interval width
-heat2d_df <- long2d %>%
-  group_by(model) %>%
-  mutate(
-    risk_bin  = ntile(q50, n_risk_bins),
-    width_bin = ntile(w,   n_w_bins)
-  ) %>%
-  group_by(model, risk_bin, width_bin) %>%
-  summarise(
-    n_cell   = n(),
-    q50_med  = median(q50, na.rm = TRUE),
-    w_med    = median(w,   na.rm = TRUE),
-    coverage = mean(cov,   na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    # Deviation from target coverage
-    delta = coverage - alpha_target,
-    # Binomial standard error
-    se = sqrt(coverage * (1 - coverage) / n_cell),
-    lower = pmax(0, coverage - 1.96 * se),
-    upper = pmin(1, coverage + 1.96 * se)
-  )
-
-min_n_cell <- 50
-
-heat2d_plot <- heat2d_df %>%
-  # Remove unreliable cells (too few samples)
-  mutate(
-    delta_plot = ifelse(n_cell < min_n_cell, NA_real_, delta)
-  )
-
-p_heat_delta <- ggplot(
-  heat2d_df %>% mutate(delta_plot = ifelse(n_cell < min_n_cell, NA, delta)),
-  aes(x = risk_bin, y = width_bin, fill = delta_plot)
-) +
-  geom_tile(color = "white", linewidth = 0.3) +
-  facet_wrap(~ model, ncol = 2) +
-  scale_x_continuous(breaks = 1:n_risk_bins) +
-  scale_y_continuous(breaks = 1:n_w_bins) +
-  scale_fill_gradient2(
-    # red -> undercoverage, white -> perfect calibration, green -> overcoverage
-    low = "#d73027", mid = "white", high = "#1a9850",
-    midpoint = 0,
-    labels = percent_format(accuracy = 1),
-    na.value = "grey90",
-    name = "Coverage - 90%"
-  ) +
-  labs(
-    title = "2D Conditional Calibration (Risk × Uncertainty)",
-    subtitle = "Heatmap of deviation from 90% coverage. Grey cells: too few samples.",
-    x = "Risk bin (by predicted median q50)",
-    y = "Uncertainty bin (by interval width w = q95 - q05)"
-  ) +
-  theme_bw(base_size = 12) +
-  theme(
-    panel.grid = element_blank(),
-    strip.background = element_rect(fill = "#f2f2f2"),
-    plot.title = element_text(face = "bold")
-  )
-
-
-p_heat_delta_n <- p_heat_delta +
-  # Overlay sample size per cell
-  geom_text(
-    data = heat2d_plot %>% filter(!is.na(delta_plot)),
-    aes(label = n_cell),
-    size = 2.6,
-    color = "grey20"
-  )
-
-
-p_heat_delta_n
-
-
-
-
-# ========================================
-# HYBRID MODEL: Neural Network Features + DRF
-# Two-Stage Learning: NN for representation, DRF for distribution
-# Hypothesis: Beats both pure NN (ENS/MCD) and pure forest (DRF/QRF)
-# ========================================
-
-cat("\n\n========================================\n")
-cat("TRAINING HYBRID MODEL: Neural Features + DRF\n")
-cat("========================================\n\n")
-
-
-# ========================================
-# Stage 1: Train Feature Extractor
-# ========================================
-
-cat("Stage 1: Training neural feature extractor...\n")
-
-set.seed(2026)
-
-# Define modular network: separate feature extractor and output head
-# This allows us to extract 64-dim features before the quantile outputs
-nn_feature_extractor <- nn_sequential(
-  nn_linear(n_input, 128),
-  nn_relu(),
-  nn_linear(128, 64),
-  nn_relu()
-)
-
-nn_output_head <- nn_linear(64, n_quantiles)
-
-
-# Pinball loss (already defined earlier, but repeat for clarity)
-if (!exists("pinball_loss")) {
-  pinball_loss <- function(pred, y_true, tau) {
-    errors <- y_true - pred
-    loss <- torch_where(
-      errors >= 0,
-      tau * errors,
-      (tau - 1) * errors
-    )
-    torch_mean(loss)
-  }
-}
-
-
-# Train the full network (feature_extractor + output_head)
-cat("  Training for 150 epochs...\n")
-
-optimizer_hybrid <- optim_adam(
-  c(nn_feature_extractor$parameters, nn_output_head$parameters), 
-  lr = 0.001
-)
-
-nn_feature_extractor$train()
-nn_output_head$train()
-
-for (epoch in seq_len(150)) {
-  optimizer_hybrid$zero_grad()
-  
-  # Forward: raw_features -> hidden_features -> quantiles
-  hidden_features <- nn_feature_extractor(X_tr_t)
-  quantile_preds <- nn_output_head(hidden_features)
-  
-  loss <- pinball_loss(quantile_preds, y_tr_t, tau_t)
-  loss$backward()
-  optimizer_hybrid$step()
-  
-  if (epoch %% 50 == 0) {
-    cat(sprintf("    Epoch %d, Loss: %.4f\n", epoch, as.numeric(loss)))
-  }
-}
-
-cat("  Neural network training complete.\n\n")
-
-
-# ========================================
-# Stage 2: Extract Learned Features
-# ========================================
-
-cat("Stage 2: Extracting 64-dimensional neural features...\n")
-
-nn_feature_extractor$eval()
-
-with_no_grad({
-  # Extract learned representations (64-dim vectors)
-  neural_features_tr <- as.matrix(nn_feature_extractor(X_tr_t))
-  neural_features_te <- as.matrix(nn_feature_extractor(X_te_t))
+model_names <- names(all_q)
+
+# Coverage & width
+cov_width <- do.call(rbind, lapply(model_names, function(m) {
+  r <- eval_interval(all_q[[m]], y_te)
+  data.frame(Model = m, Coverage = r$coverage, Width = r$width)
+}))
+cat("Coverage & Width:\n"); print(round(cov_width, 4))
+
+# WIS
+wis_vec <- sapply(model_names, function(m) wis_score(all_q[[m]], y_te))
+cat("\nWIS (lower = better):\n"); print(round(wis_vec, 4))
+
+# CRPS
+crps_vec <- sapply(model_names, function(m)
+  crps_from_quantiles(y_te, as.matrix(all_qgrid[[m]]), q_grid))
+cat("\nCRPS (lower = better):\n"); print(round(crps_vec, 4))
+
+# NLL  (Gamma-exact for parametric models, quantile-approx for non-parametric)
+nll_vec <- sapply(model_names, function(m) {
+  if (m == "XGB")          return(NA_real_)
+  if (m == "ENS_Gamma")    return(nll_ens)
+  if (m == "MCD_Gamma")    return(nll_mcd)
+  if (m == "DDNN_Gamma")   return(nll_ddnn)
+  if (m == "BNN_Gamma")    return(nll_bnn)
+  # non-parametric: quantile-based approximation
+  -mean(log(approx_density_from_quantiles(y_te, as.matrix(all_qgrid[[m]]), q_grid)))
 })
+cat("\nNLL (lower = better, NA = XGB/conformal):\n"); print(round(nll_vec, 4))
 
-cat(sprintf("  Train: %d samples x %d features\n", nrow(neural_features_tr), ncol(neural_features_tr)))
-cat(sprintf("  Test: %d samples x %d features\n", nrow(neural_features_te), ncol(neural_features_te)))
-
-
-# Convert to data frames with proper column names
-colnames(neural_features_tr) <- paste0("nn_feat_", 1:ncol(neural_features_tr))
-colnames(neural_features_te) <- paste0("nn_feat_", 1:ncol(neural_features_te))
-
-df_neural_tr <- as.data.frame(neural_features_tr)
-df_neural_te <- as.data.frame(neural_features_te)
-
-cat("  Feature extraction complete.\n\n")
-
-
-# ========================================
-# Stage 3: Train DRF on Neural Features
-# ========================================
-
-cat("Stage 3: Training DRF on neural features (MMD splitting)...\n")
-cat("  This may take 2-3 minutes...\n")
-
-# Train DRF using neural features as input
-hybrid_drf <- drf(
-  X = df_neural_tr,
-  Y = y_tr,
-  num.trees = 1000,
-  min.node.size = 50,
-  mtry = floor(sqrt(ncol(df_neural_tr))),  # Use sqrt(64) ≈ 8 features per split
-  sample.fraction = 0.5,
-  seed = 2026
-)
-
-cat("  DRF training on neural features complete.\n\n")
-
-
-# ========================================
-# Stage 4: Generating hybrid predictions (Fixed Version)
-# ========================================
-
-library(Matrix)
-
-hybrid_pred <- predict(hybrid_drf, newdata = df_neural_te)
-
-W_h <- hybrid_pred$weights
-y_train_h <- as.numeric(hybrid_pred$y)   # 与 W_h 的列顺序严格对齐
-
-n_te <- nrow(df_neural_te)
-
-hybrid_q05 <- numeric(n_te)
-hybrid_q50 <- numeric(n_te)
-hybrid_q95 <- numeric(n_te)
-hybrid_qgrid_mat <- matrix(NA_real_, nrow = n_te, ncol = length(q_grid))
-
-wquant_robust <- function(y, w, tau) {
-  y <- as.numeric(y)
-  w <- as.numeric(w)
-  
-  # 防御式检查
-  if (length(w) != length(y)) return(NA_real_)
-  s <- sum(w)
-  if (!is.finite(s) || s <= 0) return(NA_real_)
-  
-  w <- w / s
-  
-  ord <- order(y)
-  y <- y[ord]
-  w <- w[ord]
-  cw <- cumsum(w)
-  
-  idx <- which(cw >= tau)[1]
-  if (is.na(idx)) return(y[length(y)])
-  y[idx]
-}
-
-for (i in seq_len(n_te)) {
-  
-  # 关键：把稀疏行变成“完整长度”的 dense 向量
-  w_i <- as.numeric(Matrix::as.matrix(W_h[i, ]))
-  
-  hybrid_q05[i] <- wquant_robust(y_train_h, w_i, 0.05)
-  hybrid_q50[i] <- wquant_robust(y_train_h, w_i, 0.50)
-  hybrid_q95[i] <- wquant_robust(y_train_h, w_i, 0.95)
-  
-  for (j in seq_along(q_grid)) {
-    hybrid_qgrid_mat[i, j] <- wquant_robust(y_train_h, w_i, q_grid[j])
-  }
-}
-
-hybrid_q <- data.frame(q05 = hybrid_q05, q50 = hybrid_q50, q95 = hybrid_q95)
-
-hybrid_qgrid <- as.data.frame(hybrid_qgrid_mat)
-colnames(hybrid_qgrid) <- paste0("q", sprintf("%02d", round(100*q_grid)))
-
-
-# ========================================
-# Evaluation: Hybrid vs All Other Models
-# ========================================
-
-cat("\n========================================\n")
-cat("EVALUATION: Hybrid vs Pure Models\n")
-cat("========================================\n\n")
-
-
-# --- 1. Coverage & Width ---
-cat("1. Coverage & Interval Width:\n")
-
-# 将循环算好的向量打包进 data.frame
-hybrid_q <- data.frame(
-  q05 = hybrid_q05,
-  q50 = hybrid_q50,
-  q95 = hybrid_q95
-)
-
-# 确保没有负值（住院时间最小为训练集最小值）
-lower_bound <- min(y_tr)
-hybrid_q$q05 <- pmax(hybrid_q$q05, lower_bound)
-hybrid_q$q50 <- pmax(hybrid_q$q50, lower_bound)
-hybrid_q$q95 <- pmax(hybrid_q$q95, lower_bound)
-
-# 现在重新运行评估
-res_hybrid <- eval_interval(hybrid_q, y_te)
-
-# 重新打印表格
-comparison_table_1 <- rbind(
-  DRF = unlist(res_drf),
-  QRF = unlist(res_qrf),
-  RF  = unlist(res_rf),
-  XGB = unlist(res_xgb),
-  ENS = unlist(res_ens),
-  MCD = unlist(res_mcd),
-  HYBRID = unlist(res_hybrid)
-)
-
-print(round(comparison_table_1, 4))
-
-
-# --- 2. WIS ---
-cat("2. Weighted Interval Score (lower is better):\n")
-
-wis_hybrid <- wis_score(hybrid_q, y_te)
-
-wis_comparison <- c(
-  DRF = wis_score(drf_q, y_te),
-  QRF = wis_score(qrf_q, y_te),
-  RF  = wis_score(rf_q,  y_te),
-  XGB = wis_score(xgb_q, y_te),
-  ENS = wis_score(ens_q, y_te),
-  MCD = wis_score(mcd_q, y_te),
-  HYBRID = wis_hybrid
-)
-
-print(round(wis_comparison, 4))
-cat("\n")
-
-
-# --- 3. CRPS ---
-cat("3. CRPS (lower is better):\n")
-
-crps_hybrid <- crps_from_quantiles(y_te, as.matrix(hybrid_qgrid), q_grid)
-
-crps_comparison <- c(
-  DRF = crps_all_grid["DRF"],
-  QRF = crps_all_grid["QRF"],
-  RF  = crps_all_grid["RF"],
-  XGB = crps_all_grid["XGB"],
-  ENS = crps_all_grid["ENS"],
-  MCD = crps_all_grid["MCD"],
-  HYBRID = crps_hybrid
-)
-
-print(round(crps_comparison, 4))
-cat("\n")
-
-
-# --- 4. NLL ---
-cat("4. Negative Log-Likelihood (lower is better):\n")
-
-hybrid_densities <- approx_density_from_quantiles(y_te, as.matrix(hybrid_qgrid), q_grid)
-nll_hybrid <- -mean(log(hybrid_densities))
-
-nll_comparison <- c(
-  DRF = nll_results["DRF"],
-  QRF = nll_results["QRF"],
-  RF  = nll_results["RF"],
-  ENS = nll_results["ENS"],
-  MCD = nll_results["MCD"],
-  HYBRID = nll_hybrid
-)
-
-print(round(nll_comparison, 4))
-cat("\n")
-
-
-# ========================================
-# Key Question: Does Hybrid Beat BOTH Categories?
-# ========================================
-
-cat("\n========================================\n")
-cat("HYPOTHESIS TEST: Does Hybrid Beat Both?\n")
-cat("========================================\n\n")
-
-# Define pure NN models
-pure_nn <- c("ENS", "MCD")
-pure_forest <- c("DRF", "QRF", "RF")
-
-# Best in each category (use WIS as primary metric)
-best_nn_wis <- min(wis_comparison[pure_nn], na.rm = TRUE)
-best_forest_wis <- min(wis_comparison[pure_forest], na.rm = TRUE)
-hybrid_wis <- wis_comparison["HYBRID"]
-
-cat(sprintf("Best Pure NN (WIS): %.4f (%s)\n", 
-            best_nn_wis, 
-            names(which.min(wis_comparison[pure_nn]))))
-
-cat(sprintf("Best Pure Forest (WIS): %.4f (%s)\n", 
-            best_forest_wis, 
-            names(which.min(wis_comparison[pure_forest]))))
-
-cat(sprintf("Hybrid NN+DRF (WIS): %.4f\n", hybrid_wis))
-cat("\n")
-
-
-# Verdict
-beats_nn <- hybrid_wis < best_nn_wis
-beats_forest <- hybrid_wis < best_forest_wis
-
-if (beats_nn && beats_forest) {
-  cat("✓ ✓ ✓ SUCCESS! Hybrid beats BOTH pure NN and pure forest! ✓ ✓ ✓\n\n")
-  cat(sprintf("  Improvement over best NN: %.2f%%\n", 
-              100 * (best_nn_wis - hybrid_wis) / best_nn_wis))
-  cat(sprintf("  Improvement over best forest: %.2f%%\n", 
-              100 * (best_forest_wis - hybrid_wis) / best_forest_wis))
-  cat("\n")
-  cat("INTERPRETATION:\n")
-  cat("  - Neural network learns powerful non-linear features\n")
-  cat("  - DRF uses these features for flexible distributional modeling\n")
-  cat("  - Combination captures both representation AND uncertainty better\n")
-  
-} else if (beats_nn) {
-  cat("⚠ Partial Success: Hybrid beats pure NN, but not pure forest\n")
-  cat(sprintf("  Gap to best forest: %.2f%%\n", 
-              100 * (hybrid_wis - best_forest_wis) / best_forest_wis))
-  
-} else if (beats_forest) {
-  cat("⚠ Partial Success: Hybrid beats pure forest, but not pure NN\n")
-  cat(sprintf("  Gap to best NN: %.2f%%\n", 
-              100 * (hybrid_wis - best_nn_wis) / best_nn_wis))
-  
-} else {
-  cat("✗ Hybrid does not beat either pure approach\n")
-  cat("POSSIBLE REASONS:\n")
-  cat("  - Neural features may not add information beyond raw features\n")
-  cat("  - DRF might prefer raw features for tree splitting\n")
-  cat("  - Overfitting in feature extraction stage\n")
-}
-
-
-# ========================================
-# Summary Table for Paper
-# ========================================
-
-cat("\n\n========================================\n")
-cat("SUMMARY TABLE (All Models)\n")
-cat("========================================\n\n")
-
+# Summary table
 summary_all <- data.frame(
-  Model = c("DRF", "QRF", "RF", "XGB", "ENS", "MCD", "Hybrid_NN_DRF"),
-  Coverage = c(
-    res_drf$coverage, res_qrf$coverage, res_rf$coverage,
-    res_xgb$coverage, res_ens$coverage, res_mcd$coverage,
-    res_hybrid$coverage
-  ),
-  Width = c(
-    res_drf$width, res_qrf$width, res_rf$width,
-    res_xgb$width, res_ens$width, res_mcd$width,
-    res_hybrid$width
-  ),
-  WIS = wis_comparison,
-  CRPS = crps_comparison,
-  NLL = c(nll_comparison, NA)  # Add NA for alignment if needed
+  Model    = model_names,
+  Coverage = cov_width$Coverage,
+  Width    = cov_width$Width,
+  WIS      = wis_vec,
+  CRPS     = crps_vec,
+  NLL      = nll_vec
+)
+summary_all$WIS_Rank <- rank(summary_all$WIS, na.last = "keep")
+cat("\n=== SUMMARY TABLE ===\n")
+print(round(summary_all[order(summary_all$WIS_Rank), ], 4))
+
+
+# ---- eval_df: wide format for subgroup analysis ----
+eval_df <- as.data.frame(lapply(all_q, function(qdf) qdf))
+names(eval_df) <- paste0(
+  rep(tolower(gsub("[^a-zA-Z0-9]", "_", names(all_q))), each = 3),
+  rep(c("_q05","_q50","_q95"), times = length(all_q))
+)
+# rebuild properly
+eval_df <- do.call(data.frame, lapply(names(all_q), function(m) {
+  mn <- tolower(gsub("[^a-zA-Z0-9]", "_", m))
+  q  <- all_q[[m]]
+  setNames(q, paste0(mn, c("_q05","_q50","_q95")))
+}))
+eval_df$y          <- y_te
+
+eval_df$los_group  <- cut(y_te, c(-Inf,3,7,Inf), labels=c("Short(≤3d)","Medium(3-7d)","Long(>7d)"))
+eval_df$miss_rate  <- rowMeans(is.na(Xte_tree))
+eval_df$miss_group <- cut(eval_df$miss_rate,
+                          breaks = quantile(eval_df$miss_rate, c(0,1/3,2/3,1)),
+                          labels = c("Low missing","Mid missing","High missing"),
+                          include.lowest = TRUE)
+eval_df$vent_group <- factor(Xte_tree$vent_any,    0:1, c("No ventilation","Ventilated"))
+eval_df$vaso_group <- factor(Xte_tree$vasopressors, 0:1, c("No vasopressors","Vasopressors"))
+
+# WIS helper for subgroup
+wis_one <- function(y, q05, q50, q95) {
+  pred <- cbind(q05, q50, q95)
+  mean(scoringutils::wis(y, pred, c(0.05,0.5,0.95), na.rm=TRUE), na.rm=TRUE)
+}
+
+# Subgroup WIS (miss_group)
+make_model_col_map <- function() {
+  lapply(names(all_q), function(m) {
+    mn <- tolower(gsub("[^a-zA-Z0-9]","_",m))
+    list(label=m, q05=paste0(mn,"_q05"), q50=paste0(mn,"_q50"), q95=paste0(mn,"_q95"))
+  })
+}
+col_map <- make_model_col_map()
+
+subgroup_wis_table <- function(df, group_var) {
+  df %>%
+    group_by(.data[[group_var]]) %>%
+    summarise(
+      across(everything(), ~ NA, .names = "{.col}"),
+      .groups = "drop"
+    ) %>%
+    select(1) -> grps
+  
+  wis_cols <- lapply(col_map, function(cm) {
+    df %>%
+      group_by(.data[[group_var]]) %>%
+      summarise(!!cm$label := wis_one(y, .data[[cm$q05]], .data[[cm$q50]], .data[[cm$q95]]),
+                .groups = "drop") %>%
+      pull(!!cm$label)
+  })
+  bind_cols(grps, setNames(as.data.frame(wis_cols), sapply(col_map, `[[`, "label")))
+}
+
+out_miss_wis <- subgroup_wis_table(eval_df, "miss_group")
+cat("\n=== WIS by Missingness Subgroup ===\n"); print(out_miss_wis)
+
+out_vent_wis <- subgroup_wis_table(eval_df, "vent_group")
+cat("\n=== WIS by Ventilation Subgroup ===\n"); print(out_vent_wis)
+
+out_vaso_wis <- subgroup_wis_table(eval_df, "vaso_group")
+cat("\n=== WIS by Vasopressor Subgroup ===\n"); print(out_vaso_wis)
+
+
+# ---- CRPS all grid (already computed above) ----
+cat("\nCRPS (dense grid):\n"); print(round(crps_vec, 4))
+
+
+# ---- NLL summary ----
+nll_results <- nll_vec
+cat("\nNLL:\n"); print(round(nll_results, 4))
+
+
+# ============================================================
+# Distribution comparison plots (all 10 models)
+# ============================================================
+library(ggplot2); library(scales)
+set.seed(2026)
+n_spp <- 100  # samples per patient
+
+sample_from_quantiles <- function(qmat, taus, n_samples) {
+  n <- nrow(qmat)
+  m <- matrix(0, n, n_samples)
+  for (i in seq_len(n)) {
+    u    <- runif(n_samples)
+    m[i, ] <- approx(taus, qmat[i, ], xout = u, rule = 2)$y
+  }
+  m
+}
+
+# for Gamma parametric models sample directly from the distribution
+sample_gamma_mix <- function(shapes_list, rates_list, n_samples) {
+  M   <- length(shapes_list)
+  n   <- length(shapes_list[[1]])
+  out <- matrix(NA_real_, n, n_samples)
+  for (i in seq_len(n)) {
+    # randomly pick a member for each sample
+    mem <- sample(M, n_samples, replace = TRUE)
+    for (m in seq_len(M)) {
+      idx <- which(mem == m)
+      if (length(idx) > 0)
+        out[i, idx] <- rgamma(length(idx), shape = shapes_list[[m]][i], rate = rates_list[[m]][i])
+    }
+  }
+  out
+}
+
+cat("\nSampling from predictive distributions...\n")
+samples_list <- list(
+  DRF          = sample_from_quantiles(as.matrix(drf_qgrid),    q_grid, n_spp),
+  QRF          = sample_from_quantiles(as.matrix(qrf_qgrid),    q_grid, n_spp),
+  RF           = sample_from_quantiles(as.matrix(rf_qgrid),     q_grid, n_spp),
+  ENS_Gamma    = sample_gamma_mix(ens_shapes, ens_rates,         n_spp),
+  MCD_Gamma    = matrix(rgamma(length(y_te)*n_spp,
+                               shape = rep(mcd_params_te$shape, n_spp),
+                               rate  = rep(mcd_params_te$rate,  n_spp)),
+                        nrow = length(y_te)),
+  DDNN_Gamma   = matrix(rgamma(length(y_te)*n_spp,
+                               shape = rep(ddnn_params$shape, n_spp),
+                               rate  = rep(ddnn_params$rate,  n_spp)),
+                        nrow = length(y_te)),
+  Ensemble_DRF = sample_from_quantiles(as.matrix(edrf_qgrid),   q_grid, n_spp),
+  BNN_Gamma    = matrix(rgamma(length(y_te)*n_spp,
+                               shape = rep(bnn_params_te$shape, n_spp),
+                               rate  = rep(bnn_params_te$rate,  n_spp)),
+                        nrow = length(y_te)),
+  Hybrid_NN_DRF = sample_from_quantiles(as.matrix(hybrid_qgrid), q_grid, n_spp)
+)
+# XGB: symmetric conformal, sample from triangular approx
+samples_list$XGB <- sample_from_quantiles(as.matrix(xgb_qgrid), q_grid, n_spp)
+
+n_act <- length(y_te); n_mod <- n_act * n_spp
+
+df_dist <- bind_rows(
+  data.frame(LOS = y_te, Model = "Actual"),
+  bind_rows(lapply(names(samples_list), function(m)
+    data.frame(LOS = as.vector(samples_list[[m]]), Model = m)))
+) %>% filter(LOS >= 0, LOS <= quantile(y_te, 0.99) * 1.5)
+
+all_levels <- c("Actual", model_names)
+df_dist$Model <- factor(df_dist$Model, levels = all_levels)
+
+# Colour palette
+MODEL_COLOR <- c(
+  Actual       = "gray20",
+  DRF          = "#D65C5C", QRF       = "#5A9BD4", RF            = "#66BB66",
+  XGB          = "#E8A838", ENS_Gamma = "#9B59B6", MCD_Gamma     = "#E67E22",
+  DDNN_Gamma   = "#1ABC9C", Ensemble_DRF = "#C0392B", BNN_Gamma  = "#2471A3",
+  Hybrid_NN_DRF = "#6E2F1A"
+)
+MODEL_FILL <- c(
+  DRF          = "#F4A3A3", QRF       = "#A8C5E5", RF            = "#B7E3B0",
+  XGB          = "#FAD7A0", ENS_Gamma = "#D7BDE2", MCD_Gamma     = "#FDEBD0",
+  DDNN_Gamma   = "#A3E4D7", Ensemble_DRF = "#F1948A", BNN_Gamma = "#AED6F1",
+  Hybrid_NN_DRF = "#D7BFAE"
 )
 
-# Remove XGB from NLL (no density)
-summary_all$NLL[summary_all$Model == "XGB"] <- NA
+df_actual_bg <- df_dist %>% filter(Model == "Actual") %>% select(-Model)
 
-print(summary_all)
+p_dist <- ggplot() +
+  geom_density(data = df_actual_bg, aes(x = LOS),
+               fill = "gray60", color = "gray30", alpha = 0.7, linewidth = 0.4) +
+  geom_density(data = df_dist %>% filter(Model != "Actual"),
+               aes(x = LOS, fill = Model, color = Model),
+               alpha = 0.45, linewidth = 0.85) +
+  facet_wrap(~ Model, ncol = 3) +
+  scale_fill_manual(values  = MODEL_FILL,  na.value = "gray80") +
+  scale_color_manual(values = MODEL_COLOR, na.value = "gray40") +
+  coord_cartesian(xlim = c(0, quantile(y_te, 0.95) * 1.3)) +
+  theme_bw(base_size = 12) +
+  labs(title    = "Predictive Distributions vs Actual LOS (All 10 Models)",
+       subtitle = "Gray = actual LOS distribution repeated in every panel",
+       x = "Length of Stay (Days)", y = "Density") +
+  theme(strip.text       = element_text(face = "bold"),
+        legend.position  = "none",
+        panel.grid.minor = element_blank(),
+        plot.title       = element_text(face = "bold"))
 
-
-# Rank models by WIS
-summary_all$WIS_Rank <- rank(summary_all$WIS, na.last = TRUE)
-
-cat("\n\nModel Rankings (by WIS, 1 = best):\n")
-print(summary_all[order(summary_all$WIS_Rank), c("Model", "WIS", "WIS_Rank")])
-
-
-# ========================================
-# Visualization: Add Hybrid to Distribution Comparison
-# ========================================
-
-cat("\n\nGenerating hybrid distribution plot...\n")
-
-# Sample from hybrid for distribution comparison
-hybrid_samples <- sample_from_quantiles(as.matrix(hybrid_qgrid), q_grid, n_samples_per_patient)
-
-# Create extended data frame
-df_dist_extended <- rbind(
-  df_dist,
-  data.frame(
-    LOS = as.vector(hybrid_samples),
-    Model = "Hybrid_NN_DRF"
-  )
-)
-
-df_dist_extended$Model <- factor(
-  df_dist_extended$Model, 
-  levels = c("Actual", "DRF", "QRF", "RF", "ENS", "MCD", "Hybrid_NN_DRF")
-)
+print(p_dist)
+ggsave("/mnt/user-data/outputs/all_models_dist_comparison.png",
+       plot = p_dist, width = 16, height = 14, dpi = 300)
+cat("✓ Saved: all_models_dist_comparison.png\n")
 
 
-# Plot: Overlaid densities
-p_hybrid_overlay <- ggplot(df_dist_extended, aes(x = LOS, color = Model, linetype = Model)) +
-  geom_density(linewidth = 1.2, alpha = 0.7) +
-  
-  scale_color_manual(
-    values = c(
-      "Actual" = "black",
-      "DRF" = "#e41a1c",
-      "QRF" = "#984ea3",
-      "RF" = "#ff7f00",
-      "ENS" = "#377eb8",
-      "MCD" = "#4daf4a",
-      "Hybrid_NN_DRF" = "#a65628"  # Brown for hybrid
-    )
-  ) +
-  
-  scale_linetype_manual(
-    values = c(
-      "Actual" = "solid",
-      "DRF" = "solid",
-      "QRF" = "dashed",
-      "RF" = "dashed",
-      "ENS" = "dotted",
-      "MCD" = "dotted",
-      "Hybrid_NN_DRF" = "solid"
-    )
-  ) +
-  
-  labs(
-    title = "Hybrid Model: Neural Features + DRF",
-    subtitle = "Combining neural representation learning with distributional random forest",
-    x = "Length of Stay (Days)",
-    y = "Density"
-  ) +
-  
-  theme_minimal(base_size = 13) +
-  theme(
-    legend.position = "right",
-    plot.title = element_text(face = "bold", size = 15),
-    panel.grid.minor = element_blank()
-  ) +
-  
-  coord_cartesian(xlim = c(0, quantile(y_te, 0.95) * 1.2))
+# ---- Conditional calibration ----
+K <- 10
+cal_df <- bind_rows(lapply(names(all_q), function(m) {
+  eval_df %>%
+    transmute(model = m, y,
+              q05 = all_q[[m]]$q05,
+              q50 = all_q[[m]]$q50,
+              q95 = all_q[[m]]$q95)
+})) %>%
+  mutate(x = q50, covered = (y >= q05) & (y <= q95)) %>%
+  group_by(model) %>%
+  mutate(bin = ntile(x, K)) %>%
+  group_by(model, bin) %>%
+  summarise(x = mean(x, na.rm=TRUE), coverage = mean(covered, na.rm=TRUE),
+            n_bin = n(), .groups="drop") %>%
+  mutate(se    = sqrt(coverage*(1-coverage)/n_bin),
+         lower = pmax(0, coverage-1.96*se),
+         upper = pmin(1, coverage+1.96*se),
+         model = factor(model, levels = model_names))
 
-print(p_hybrid_overlay)
+p_cal <- ggplot(cal_df, aes(x=x, y=coverage)) +
+  geom_hline(yintercept=0.90, linetype="dashed", color="red", alpha=0.6) +
+  geom_ribbon(aes(ymin=lower, ymax=upper), fill="steelblue", alpha=0.15) +
+  geom_line(color="steelblue", linewidth=0.8) +
+  geom_point(color="steelblue", size=1.5, alpha=0.8) +
+  facet_wrap(~model, ncol=2) +
+  scale_y_continuous(labels=percent, limits=c(0.55,1.0)) +
+  labs(title="Conditional Calibration of 90% Prediction Intervals (All Models)",
+       x="Predicted Median LOS (Days)", y="Empirical Coverage (%)") +
+  theme_bw(base_size=11) +
+  theme(strip.background=element_rect(fill="#f0f0f0"),
+        panel.grid.minor=element_blank(),
+        plot.title=element_text(face="bold"))
 
-ggsave("/mnt/user-data/outputs/hybrid_distribution_comparison.png",
-       plot = p_hybrid_overlay, width = 12, height = 6.5, dpi = 300)
-
-cat("✓ Plot saved to: /mnt/user-data/outputs/hybrid_distribution_comparison.png\n")
+print(p_cal)
+ggsave("/mnt/user-data/outputs/conditional_calibration_all.png",
+       plot=p_cal, width=12, height=18, dpi=300)
+cat("✓ Saved: conditional_calibration_all.png\n")
 
 
-# Plot: Faceted comparison (highlight hybrid)
-df_highlight <- df_dist_extended %>%
-  filter(Model %in% c("Actual", "DRF", "ENS", "Hybrid_NN_DRF"))
+# ---- Coverage vs Width ----
+cover_long <- bind_rows(lapply(names(all_q), function(m) {
+  eval_df %>%
+    transmute(model=m, y,
+              w   = all_q[[m]]$q95 - all_q[[m]]$q05,
+              cov = as.integer(y>=all_q[[m]]$q05 & y<=all_q[[m]]$q95))
+})) %>% filter(is.finite(w), w>=0) %>%
+  mutate(model = factor(model, levels = model_names))
 
-p_hybrid_facet <- ggplot() +
-  geom_density(
-    data = df_highlight %>% filter(Model == "Actual"),
-    aes(x = LOS),
-    fill = "gray70", alpha = 0.3, color = "black", linewidth = 0.6
-  ) +
-  
-  geom_density(
-    data = df_highlight %>% filter(Model != "Actual"),
-    aes(x = LOS, fill = Model, color = Model),
-    alpha = 0.5, linewidth = 1
-  ) +
-  
-  facet_wrap(~ Model, ncol = 3, scales = "free_y") +
-  
-  scale_fill_manual(
-    values = c(
-      "DRF" = "#e41a1c",
-      "ENS" = "#377eb8",
-      "Hybrid_NN_DRF" = "#4daf4a"
-    )
-  ) +
-  
-  scale_color_manual(
-    values = c(
-      "DRF" = "#e41a1c",
-      "ENS" = "#377eb8",
-      "Hybrid_NN_DRF" = "#4daf4a"
-    )
-  ) +
-  
-  labs(
-    title = "Hybrid vs Pure Models: Distribution Fit",
-    subtitle = "Gray background = actual distribution in each panel",
-    x = "Length of Stay (Days)",
-    y = "Density"
-  ) +
-  
-  theme_minimal(base_size = 12) +
-  theme(
-    legend.position = "none",
-    plot.title = element_text(face = "bold", size = 14),
-    strip.background = element_rect(fill = "#f0f0f0", color = "gray80"),
-    strip.text = element_text(face = "bold")
-  ) +
-  
-  coord_cartesian(xlim = c(0, quantile(y_te, 0.95) * 1.2))
+cal_w <- cover_long %>%
+  group_by(model) %>%
+  mutate(w_bin = ntile(w, 10)) %>%
+  group_by(model, w_bin) %>%
+  summarise(n_bin=n(), x=median(w, na.rm=TRUE), coverage=mean(cov, na.rm=TRUE), .groups="drop") %>%
+  mutate(se    = sqrt(coverage*(1-coverage)/n_bin),
+         lower = pmax(0, coverage-1.96*se),
+         upper = pmin(1, coverage+1.96*se))
 
-print(p_hybrid_facet)
+p_cov_w <- ggplot(cal_w, aes(x=x, y=coverage)) +
+  geom_hline(yintercept=0.90, linetype="dashed", linewidth=0.8, alpha=0.7) +
+  geom_ribbon(aes(ymin=lower,ymax=upper), alpha=0.15) +
+  geom_line(linewidth=0.9) + geom_point(size=2, alpha=0.85) +
+  facet_wrap(~model, ncol=2, scales="free_x") +
+  scale_y_continuous(labels=percent_format(accuracy=1), limits=c(0,1)) +
+  labs(title="Coverage vs Predicted Interval Width (90% PI) — All Models",
+       x="Predicted interval width [bin median]", y="Empirical coverage") +
+  theme_bw(base_size=11) +
+  theme(strip.background=element_rect(fill="#f2f2f2"),
+        panel.grid.minor=element_blank(), plot.title=element_text(face="bold"))
 
-ggsave("/mnt/user-data/outputs/hybrid_facet_comparison.png",
-       plot = p_hybrid_facet, width = 11, height = 5, dpi = 300)
-
-cat("✓ Plot saved to: /mnt/user-data/outputs/hybrid_facet_comparison.png\n")
+print(p_cov_w)
+ggsave("/mnt/user-data/outputs/coverage_vs_width_all.png",
+       plot=p_cov_w, width=12, height=18, dpi=300)
+cat("✓ Saved: coverage_vs_width_all.png\n")
 
 
-# ========================================
-# Feature Importance: Which Neural Features Matter?
-# ========================================
+# ---- KL divergence & KS test ----
+kl_divergence_kde <- function(x_true, x_pred, n_grid = 200) {
+  xl <- min(c(x_true, x_pred), na.rm=TRUE); xh <- max(c(x_true, x_pred), na.rm=TRUE)
+  p  <- density(x_true, from=xl, to=xh, n=n_grid)$y
+  q  <- density(x_pred, from=xl, to=xh, n=n_grid)$y
+  eps <- 1e-10; p <- pmax(p,eps)/sum(pmax(p,eps)); q <- pmax(q,eps)/sum(pmax(q,eps))
+  sum(p * log(p/q), na.rm=TRUE)
+}
 
-cat("\n\n========================================\n")
-cat("NEURAL FEATURE IMPORTANCE\n")
+cat("\nComputing KL divergence and KS distance...\n")
+kl_results <- sapply(names(samples_list), function(m)
+  kl_divergence_kde(y_te, as.vector(samples_list[[m]])))
+ks_results <- sapply(names(samples_list), function(m)
+  ks.test(y_te, as.vector(samples_list[[m]]))$statistic)
+
+cat("\nKL Divergence (lower = better):\n"); print(round(kl_results, 4))
+cat("\nKS Distance   (lower = better):\n"); print(round(ks_results, 4))
+
+
+# ---- 2D calibration heatmap ----
+n_risk_bins <- 8; n_w_bins <- 8; min_n_cell <- 30
+
+long2d <- bind_rows(lapply(names(all_q), function(m) {
+  eval_df %>%
+    transmute(model = m, y,
+              q50  = all_q[[m]]$q50,
+              w    = all_q[[m]]$q95 - all_q[[m]]$q05,
+              cov  = as.integer(y>=all_q[[m]]$q05 & y<=all_q[[m]]$q95))
+})) %>% filter(is.finite(q50), is.finite(w), w>=0) %>%
+  mutate(model = factor(model, levels=model_names))
+
+heat2d <- long2d %>%
+  group_by(model) %>%
+  mutate(risk_bin  = ntile(q50, n_risk_bins),
+         width_bin = ntile(w,   n_w_bins)) %>%
+  group_by(model, risk_bin, width_bin) %>%
+  summarise(n_cell=n(), coverage=mean(cov, na.rm=TRUE), .groups="drop") %>%
+  mutate(delta = coverage - 0.90,
+         delta_plot = ifelse(n_cell < min_n_cell, NA, delta))
+
+p_heat <- ggplot(heat2d, aes(x=risk_bin, y=width_bin, fill=delta_plot)) +
+  geom_tile(color="white", linewidth=0.3) +
+  facet_wrap(~model, ncol=2) +
+  scale_fill_gradient2(low="#d73027", mid="white", high="#1a9850",
+                       midpoint=0, labels=percent_format(accuracy=1),
+                       na.value="grey90", name="Coverage\n- 90%") +
+  labs(title   = "2D Conditional Calibration (Risk × Uncertainty) — All Models",
+       subtitle = "Grey = too few samples (<30)",
+       x = "Risk bin (predicted median)", y = "Uncertainty bin (interval width)") +
+  theme_bw(base_size=11) +
+  theme(panel.grid=element_blank(), strip.background=element_rect(fill="#f2f2f2"),
+        plot.title=element_text(face="bold"))
+
+print(p_heat)
+ggsave("/mnt/user-data/outputs/calibration_heatmap_all.png",
+       plot=p_heat, width=12, height=20, dpi=300)
+cat("✓ Saved: calibration_heatmap_all.png\n")
+
+
+# ---- Hypothesis test: does Hybrid beat all categories? ----
+cat("\n========================================\n")
+cat("HYPOTHESIS: Does Hybrid beat all categories?\n")
+cat("========================================\n")
+
+gamma_nn_models  <- c("ENS_Gamma","MCD_Gamma","DDNN_Gamma","BNN_Gamma")
+forest_models    <- c("DRF","QRF","RF","Ensemble_DRF")
+
+best_gamma_wis   <- min(wis_vec[gamma_nn_models], na.rm=TRUE)
+best_forest_wis  <- min(wis_vec[forest_models],   na.rm=TRUE)
+hybrid_wis_val   <- wis_vec["Hybrid_NN_DRF"]
+
+cat(sprintf("Best Gamma-NN WIS:   %.4f  (%s)\n", best_gamma_wis,
+            names(which.min(wis_vec[gamma_nn_models]))))
+cat(sprintf("Best Forest WIS:     %.4f  (%s)\n", best_forest_wis,
+            names(which.min(wis_vec[forest_models]))))
+cat(sprintf("Hybrid NN+DRF WIS:   %.4f\n", hybrid_wis_val))
+
+beats_nn     <- hybrid_wis_val < best_gamma_wis
+beats_forest <- hybrid_wis_val < best_forest_wis
+if (beats_nn && beats_forest) {
+  cat("\n✓ ✓ ✓  Hybrid beats BOTH Gamma-NN and forest categories!\n")
+  cat(sprintf("  Δ vs best Gamma-NN:  %.2f%%\n", 100*(best_gamma_wis-hybrid_wis_val)/best_gamma_wis))
+  cat(sprintf("  Δ vs best forest:    %.2f%%\n", 100*(best_forest_wis-hybrid_wis_val)/best_forest_wis))
+} else if (beats_nn)     cat("\n⚠ Hybrid beats Gamma-NN but not forest\n")
+else if (beats_forest)   cat("\n⚠ Hybrid beats forest but not Gamma-NN\n")
+else                     cat("\n✗ Hybrid does not beat either category\n")
+
+
+# ---- Save outputs ----
+write.csv(summary_all, "/mnt/user-data/outputs/summary_all_models.csv",    row.names=FALSE)
+write.csv(out_miss_wis,"/mnt/user-data/outputs/subgroup_miss_wis.csv",     row.names=FALSE)
+write.csv(out_vent_wis,"/mnt/user-data/outputs/subgroup_vent_wis.csv",     row.names=FALSE)
+write.csv(out_vaso_wis,"/mnt/user-data/outputs/subgroup_vaso_wis.csv",     row.names=FALSE)
+
+saveRDS(list(
+  summary          = summary_all,
+  wis              = wis_vec,
+  crps             = crps_vec,
+  nll              = nll_results,
+  kl               = kl_results,
+  ks               = ks_results,
+  best_hyperparams = best_hyperparameters,
+  # model objects
+  drf_fit          = drf_fit,
+  qrf_fit          = qrf_fit,
+  rf_q_fit         = rf_q_fit,
+  xgb_fit          = xgb_fit,
+  ens_members      = ens_members,
+  mc_dropout_net   = mc_dropout_net,
+  ddnn_net         = ddnn_net,
+  edrf_members     = edrf_members,
+  bnn_net          = bnn_net,
+  hybrid_drf       = hybrid_drf,
+  nn_feat_extractor = nn_feat_extractor
+), "/mnt/user-data/outputs/all_model_results.rds")
+
+cat("\n✓ All results saved to /mnt/user-data/outputs/\n")
+cat("\n========================================\n")
+cat("✓ ✓ ✓  ALL 10 MODELS COMPLETE  ✓ ✓ ✓\n")
 cat("========================================\n\n")
 
-# Extract variable importance from DRF
-var_importance <- hybrid_drf$variable.importance
-
-cat("Top 15 most important neural features for DRF splitting:\n")
-top_features <- head(sort(var_importance, decreasing = TRUE), 15)
-print(round(top_features, 4))
-
-cat("\n")
-cat("INTERPRETATION:\n")
-cat("  - DRF identifies which learned representations are most useful\n")
-cat("  - High importance = feature strongly discriminates LOS distributions\n")
-cat("  - This validates that neural features encode predictive information\n")
-
-
-# ========================================
-# Save Hybrid Model Results
-# ========================================
-
-cat("\n\n========================================\n")
-cat("SAVING RESULTS\n")
-cat("========================================\n\n")
-
-hybrid_results <- list(
-  # Predictions
-  quantiles = hybrid_q,
-  quantile_grid = hybrid_qgrid,
-  
-  # Features
-  neural_features_train = neural_features_tr,
-  neural_features_test = neural_features_te,
-  
-  # Models
-  feature_extractor = nn_feature_extractor,
-  drf_model = hybrid_drf,
-  
-  # Metrics
-  summary_table = summary_all,
-  wis_comparison = wis_comparison,
-  feature_importance = var_importance
-)
-
-saveRDS(hybrid_results, "/mnt/user-data/outputs/hybrid_nn_drf_results.rds")
-cat("✓ Results saved to: /mnt/user-data/outputs/hybrid_nn_drf_results.rds\n")
-
-
-cat("\n\n========================================\n")
-cat("✓ ✓ ✓ HYBRID MODEL EVALUATION COMPLETE ✓ ✓ ✓\n")
-cat("========================================\n\n")
 
 
