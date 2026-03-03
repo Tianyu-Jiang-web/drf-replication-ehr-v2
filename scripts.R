@@ -239,8 +239,8 @@ wquant_matrix <- function(y_train, W_sparse, probs) {
 cat("\nTuning DRF hyperparameters (3-fold CV)...\n")
 
 drf_params_test <- expand.grid(
-  num.trees = c(500, 1000),
-  min.node.size = c(20, 50, 100)
+  num.trees = c(500),
+  min.node.size = c(5, 10, 15, 20, 25, 30, 35, 40)
 )
 
 drf_cv_scores <- sapply(seq_len(nrow(drf_params_test)), function(i) {
@@ -710,6 +710,12 @@ x_sd        <- apply(Xtr_ens_mm, 2, sd); x_sd[x_sd == 0] <- 1
 Xtr_ens_sc  <- scale(Xtr_ens_mm, center = x_mean, scale = x_sd)
 Xte_ens_sc  <- scale(Xte_ens_mm, center = x_mean, scale = x_sd)
 
+# 在 Xtr_ens_sc 和 Xte_ens_sc 定义后加入
+Xtr_ens_sc[Xtr_ens_sc > 10] <- 10
+Xtr_ens_sc[Xtr_ens_sc < -10] <- -10
+Xte_ens_sc[Xte_ens_sc > 10] <- 10
+Xte_ens_sc[Xte_ens_sc < -10] <- -10
+
 n_input     <- ncol(Xtr_ens_sc)
 n_quantiles <- length(q_grid)
 
@@ -729,15 +735,32 @@ y_va_cv      <- y_tr[val_idx_nn]
 # SHARED: Gamma NLL loss (log-space params -> shape, rate)
 # ============================================================
 gamma_nll_loss <- function(params, y_true) {
-  # params: [B, 2]  col1=log_shape, col2=log_rate
-  shape <- torch_exp(params[, 1, drop = FALSE])
-  rate  <- torch_exp(params[, 2, drop = FALSE])
-  nll   <- -(
-    (shape - 1) * torch_log(y_true + 1e-8) -
-      rate  * y_true +
-      shape * torch_log(rate + 1e-8) -
+  # 1. 严格限制 log 空间的范围，防止 exp(params) 产生 Inf
+  # 这里的 -7 到 5 对应 shape/rate 在 [0.001, 148] 之间
+  params <- torch_clamp(params, min = -7, max = 5)
+  
+  shape <- torch_exp(params$select(2L, 1L))
+  rate  <- torch_exp(params$select(2L, 2L))
+  
+  # 2. 进一步加固 shape，防止 lgamma(shape) 梯度爆炸
+  # Gamma 在 shape 接近 0 或非常大时都不稳定
+  shape <- torch_clamp(shape, min = 0.05, max = 40)
+  rate  <- torch_clamp(rate,  min = 0.01, max = 40)
+  
+  y <- y_true$view(-1)
+  
+  # 3. 计算 NLL (带稳定性偏移)
+  nll <- -(
+    (shape - 1) * torch_log(y + 1e-6) -
+      rate * y +
+      shape * torch_log(rate + 1e-6) -
       torch_lgamma(shape)
   )
+  
+  # 4. 彻底处理 NaN/Inf
+  nll <- torch_where(torch_isnan(nll) | torch_isinf(nll), 
+                     torch_tensor(1e4, device = device), nll)
+  
   torch_mean(nll)
 }
 
@@ -762,8 +785,20 @@ make_dl <- function(X_sc, y_obs, batch_size = 512) {
 get_gamma_params <- function(net, X_sc) {
   Xv     <- torch_tensor(X_sc, dtype = torch_float(), device = device)
   params <- with_no_grad({ net(Xv) })
+  
+  # 关键：应用与训练相同的截断
+  params <- torch_clamp(params, min = -7, max = 5)
+  
   pm     <- as.matrix(params$to(device = "cpu"))
-  list(shape = exp(pm[, 1]), rate = exp(pm[, 2]))
+  
+  # 对 shape 进行二次保护
+  shape_raw <- exp(pm[, 1])
+  rate_raw  <- exp(pm[, 2])
+  
+  list(
+    shape = pmax(0.05, pmin(40, shape_raw)),
+    rate  = pmax(0.01, pmin(40, rate_raw))
+  )
 }
 
 # ============================================================
@@ -818,7 +853,9 @@ train_gamma_dnn <- function(X_sc, y_obs, h1, h2, lr, epochs = 60, batch_size = 5
 
 # HP tuning
 cat("Tuning ENS-Gamma hyperparameters...\n")
-ens_grid <- expand.grid(h1 = c(64, 128), h2 = c(32, 64), lr = c(5e-4, 1e-3))
+# 修改调优网格，先用小学习率
+ens_grid <- expand.grid(h1 = c(64, 128), h2 = c(32, 64), lr = c(5e-5, 1e-4))
+
 
 ens_cv <- sapply(seq_len(nrow(ens_grid)), function(i) {
   hp <- ens_grid[i, ]
