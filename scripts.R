@@ -6,6 +6,13 @@ library(tidyr)
 df <- read.csv("data/FINAL_master_dataset_9Feb2026(in).csv") %>%
   filter(!is.na(icu_los_days))
 
+# ---- fix impossible RR=0 (treat as missing) ----
+if ("icu_rr_last24h_final" %in% names(df)) {
+  df$icu_rr_last24h_final[df$icu_rr_last24h_final == 0] <- NA
+} else if ("icu_rr_last24h" %in% names(df)) {
+  df$icu_rr_last24h[df$icu_rr_last24h == 0] <- NA
+}
+
 # variable mapping
 race_mapping <- c(
   "WHITE" = "White",
@@ -71,10 +78,22 @@ drop_cols <- c(
 
 # drop the column based on created vector
 df2 <- df2 %>% select(-any_of(drop_cols))
-
+# ---- drop no-information / unwanted cols ----
+extra_drop <- c("arni", "mask_vent_or_intub", "icd_flag")
+df2 <- df2 %>% select(-any_of(extra_drop))
 
 names(df2) <- sub("_final$", "", names(df2))
 
+
+# ---- fix pseudo-missing: "" -> NA for categorical columns ----
+cat_cols_raw <- intersect(c("race_clean","marital_status","insurance","gender","first_careunit"), names(df2))
+
+df2 <- df2 %>%
+  mutate(across(all_of(cat_cols_raw), ~ {
+    x <- trimws(as.character(.x))
+    x[x == ""] <- NA_character_
+    x
+  }))
 
 # transfer categories variables as factor
 
@@ -90,6 +109,7 @@ num_cols <- setdiff(num_cols, "y")
 for (v in num_cols) {
   df2[[paste0(v, "_miss")]] <- as.integer(is.na(df2[[v]]))
 }
+
 # prepare a imputed dataset for QRF
 # extract and parse admission time from the original dataframe
 df_time <- df %>%
@@ -122,6 +142,310 @@ y <- df2$y
 X_tree <- df2 %>% select(-y)
 # X_all dataset for QRF model
 X_all  <- df_imp %>% select(-y)
+
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+library(scales)
+library(ggridges)
+
+# ── 主题设置（原版可运行）────────────────────────────────────────────────────
+theme_los <- function() {
+  theme_minimal(base_family = "sans") +
+    theme(
+      plot.title         = element_text(size = 13, face = "bold", color = "#1F3864", margin = margin(b = 6)),
+      plot.subtitle      = element_text(size = 9,  color = "#595959", margin = margin(b = 8)),
+      axis.title         = element_text(size = 9,  color = "#404040"),
+      axis.text          = element_text(size = 8,  color = "#404040"),
+      axis.text.x        = element_text(angle = 25, hjust = 1),
+      strip.text         = element_text(size = 8,  face = "bold", color = "#1F3864"),
+      panel.grid.major.y = element_line(color = "#E8E8E8", linewidth = 0.4),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor   = element_blank(),
+      legend.position    = "none",
+      plot.background    = element_rect(fill = "white", color = NA),
+      panel.background   = element_rect(fill = "#FAFAFA", color = NA),
+      plot.margin        = margin(12, 12, 8, 12)
+    )
+}
+
+# 调色板（色盲友好）
+pal_cat <- c("#2E75B6","#ED7D31","#70AD47","#FFC000","#9B59B6",
+             "#E74C3C","#1ABC9C","#95A5A6","#F39C12","#2980B9",
+             "#8E44AD","#16A085","#D35400","#2C3E50","#27AE60","#C0392B")
+COL_1 <- "#2E75B6"
+COL_0 <- "#ED7D31"
+
+# ── 全量数据 ─────────────────────────────────────────────────────────────────
+df_vis <- X_tree %>% mutate(y = y)
+y_cap  <- quantile(df_vis$y, 0.99, na.rm = TRUE)
+df_vis <- df_vis %>% mutate(y_plot = pmin(y, y_cap))
+
+N_lab    <- scales::comma(nrow(df_vis))
+cap_note <- paste0("n = ", N_lab, "  |  LOS capped at 99th pct (",
+                   round(y_cap, 1), " days)")
+
+# ════════════════════════════════════════════════════════════════════════════
+# HELPER 1: violin + boxplot  (Fig1/2 — 原版不变)
+# ════════════════════════════════════════════════════════════════════════════
+make_violin <- function(data, var, title) {
+  d <- data %>%
+    filter(!is.na(.data[[var]])) %>%
+    mutate(grp = as.character(.data[[var]])) %>%
+    group_by(grp) %>%
+    mutate(n     = n(),
+           med   = median(y_plot),
+           label = paste0(grp, "\n(n=", scales::comma(n), ")")) %>%
+    ungroup() %>%
+    mutate(label = reorder(label, med))
+  
+  cols <- pal_cat[seq_len(n_distinct(d$label))]
+  
+  ggplot(d, aes(x = label, y = y_plot, fill = label, color = label)) +
+    geom_violin(alpha = 0.30, linewidth = 0.3, trim = TRUE) +
+    geom_boxplot(width = 0.18, alpha = 0.85, linewidth = 0.45,
+                 outlier.size = 0.5, outlier.alpha = 0.25, color = "grey35") +
+    stat_summary(fun = median, geom = "point", shape = 18, size = 2.8, color = "#1F3864") +
+    scale_fill_manual(values = cols) +
+    scale_color_manual(values = cols) +
+    scale_y_continuous(labels = label_number(accuracy = 0.1),
+                       expand = expansion(mult = c(0.02, 0.05))) +
+    labs(title = title, x = NULL, y = "ICU LOS (days)") +
+    theme_los()
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# HELPER 2: ridgeline for BINARY variables  (Fig3/4/5)
+#   每个变量两条脊线叠加：Yes(=1) 蓝 vs No(=0) 橙，竖线=中位数
+#   变量按两组 LOS gap 从小到大排（gap 大的在顶部）
+# ════════════════════════════════════════════════════════════════════════════
+make_ridge_binary <- function(data, vars, title, label_map = NULL, min_n = 50) {
+  rows <- lapply(vars, function(v) {
+    if (!v %in% names(data)) return(NULL)
+    d  <- data %>% filter(!is.na(.data[[v]]))
+    n1 <- sum(d[[v]] == 1, na.rm = TRUE)
+    n0 <- sum(d[[v]] == 0, na.rm = TRUE)
+    if (n1 < min_n || n0 < min_n) return(NULL)
+    nm <- if (!is.null(label_map) && v %in% names(label_map)) label_map[[v]] else v
+    bind_rows(
+      d %>% filter(.data[[v]] == 1) %>%
+        transmute(y_plot, variable = nm, gtype = "1",
+                  n1 = n1, n0 = n0),
+      d %>% filter(.data[[v]] == 0) %>%
+        transmute(y_plot, variable = nm, gtype = "0",
+                  n1 = n1, n0 = n0)
+    )
+  }) %>% bind_rows()
+  
+  if (is.null(rows) || nrow(rows) == 0) return(NULL)
+  
+  # Sort by gap (largest at top)
+  var_order <- rows %>%
+    group_by(variable, gtype) %>%
+    summarise(med = median(y_plot), .groups = "drop") %>%
+    pivot_wider(names_from = gtype, values_from = med) %>%
+    mutate(gap = abs(`1` - `0`)) %>%
+    arrange(gap) %>%
+    pull(variable)
+  
+  rows <- rows %>% mutate(variable = factor(variable, levels = var_order))
+  
+  # y-axis labels with n
+  n_labels <- rows %>%
+    group_by(variable, gtype) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(variable) %>%
+    summarise(
+      lab = paste0(first(variable),
+                   "  Yes=", scales::comma(n[gtype=="1"]),
+                   " / No=", scales::comma(n[gtype=="0"])),
+      .groups = "drop"
+    )
+  lev_map <- setNames(n_labels$lab, n_labels$variable)
+  rows <- rows %>% mutate(var_lab = lev_map[as.character(variable)],
+                          var_lab = factor(var_lab, levels = lev_map[levels(variable)]))
+  
+  ggplot(rows, aes(x = y_plot, y = var_lab, fill = gtype, color = gtype)) +
+    geom_density_ridges(alpha = 0.45, linewidth = 0.35,
+                        quantile_lines = TRUE, quantiles = 0.5,
+                        scale = 0.88, rel_min_height = 0.01) +
+    scale_fill_manual(values  = c("1" = COL_1, "0" = COL_0)) +
+    scale_color_manual(values = c("1" = COL_1, "0" = COL_0)) +
+    scale_x_continuous(labels = label_number(accuracy = 0.1),
+                       expand = expansion(mult = c(0.01, 0.05))) +
+    labs(title    = title,
+         subtitle = paste0(cap_note,
+                           "  |  Blue = Yes (=1)   Orange = No (=0)   ",
+                           "vertical line = median  |  sorted by LOS gap"),
+         x = "ICU LOS (days)", y = NULL) +
+    theme_los() +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+          axis.text.y = element_text(size = 7.5))
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# HELPER 3: ridgeline for MISSINGNESS  (Fig6)
+# ════════════════════════════════════════════════════════════════════════════
+make_ridge_miss <- function(data, top_n = 20) {
+  miss_vars <- grep("_miss$", names(data), value = TRUE)
+  
+  gaps <- lapply(miss_vars, function(v) {
+    d      <- data %>% filter(!is.na(.data[[v]]))
+    n_miss <- sum(d[[v]] == 1, na.rm = TRUE)
+    n_obs  <- sum(d[[v]] == 0, na.rm = TRUE)
+    if (n_miss < 30 || n_obs < 30) return(NULL)
+    tibble(v = v, nm = sub("_miss$", "", v),
+           gap  = abs(median(d$y_plot[d[[v]] == 1], na.rm = TRUE) -
+                        median(d$y_plot[d[[v]] == 0], na.rm = TRUE)),
+           n_miss = n_miss, n_obs = n_obs)
+  }) %>% bind_rows() %>% arrange(desc(gap)) %>% slice_head(n = top_n)
+  
+  rows <- lapply(seq_len(nrow(gaps)), function(i) {
+    v  <- gaps$v[i]; nm <- gaps$nm[i]
+    n0 <- gaps$n_obs[i]; n1 <- gaps$n_miss[i]
+    d  <- data %>% filter(!is.na(.data[[v]]))
+    bind_rows(
+      d %>% filter(.data[[v]] == 0) %>%
+        transmute(y_plot, variable = nm, gtype = "obs",
+                  lab = paste0(nm, "  obs=", scales::comma(n0),
+                               " / miss=", scales::comma(n1))),
+      d %>% filter(.data[[v]] == 1) %>%
+        transmute(y_plot, variable = nm, gtype = "mis",
+                  lab = paste0(nm, "  obs=", scales::comma(n0),
+                               " / miss=", scales::comma(n1)))
+    )
+  }) %>% bind_rows()
+  
+  var_order <- gaps %>% arrange(gap) %>% pull(nm)
+  lab_order <- lapply(var_order, function(nm) {
+    rows %>% filter(variable == nm) %>% pull(lab) %>% first()
+  }) %>% unlist()
+  
+  rows <- rows %>% mutate(lab = factor(lab, levels = lab_order))
+  
+  ggplot(rows, aes(x = y_plot, y = lab, fill = gtype, color = gtype)) +
+    geom_density_ridges(alpha = 0.45, linewidth = 0.35,
+                        quantile_lines = TRUE, quantiles = 0.5,
+                        scale = 0.88, rel_min_height = 0.01) +
+    scale_fill_manual(values  = c("obs" = COL_1, "mis" = COL_0)) +
+    scale_color_manual(values = c("obs" = COL_1, "mis" = COL_0)) +
+    scale_x_continuous(labels = label_number(accuracy = 0.1),
+                       expand = expansion(mult = c(0.01, 0.05))) +
+    labs(title    = paste0("ICU LOS Distribution by Missingness  (Top ", top_n, " by gap)"),
+         subtitle = paste0(cap_note,
+                           "  |  Blue = observed (=0)   Orange = missing (=1)   ",
+                           "vertical line = median  |  sorted by LOS gap"),
+         x = "ICU LOS (days)", y = NULL) +
+    theme_los() +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+          axis.text.y = element_text(size = 7.5))
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# BUILD FIGURES
+# ════════════════════════════════════════════════════════════════════════════
+
+# Fig1/2: 原版 violin（不变）
+p_gender    <- make_violin(df_vis, "gender",        "Gender")
+p_race      <- make_violin(df_vis, "race_clean",    "Race / Ethnicity")
+p_insurance <- make_violin(df_vis, "insurance",     "Insurance Type")
+p_marital   <- make_violin(df_vis, "marital_status","Marital Status")
+p_careunit  <- make_violin(df_vis, "first_careunit","First Care Unit")
+
+fig1 <- (p_gender | p_insurance) / (p_marital | p_race) +
+  plot_annotation(
+    title    = "ICU LOS by Categorical Variables",
+    subtitle = cap_note,
+    theme = theme(
+      plot.title      = element_text(size=15, face="bold", color="#1F3864"),
+      plot.subtitle   = element_text(size=9,  color="#595959"),
+      plot.background = element_rect(fill="white", color=NA))
+  )
+
+fig2 <- p_careunit +
+  labs(title = "ICU LOS by First Care Unit", subtitle = cap_note)
+
+# Fig3: Comorbidities
+fig3 <- make_ridge_binary(df_vis,
+                          vars = c("hypertension","copd_comorb","sepsis","diabetes","ckd","pad",
+                                   "obesity","smoking","alcohol_use",
+                                   "primary_af","primary_ami","primary_hf_cm",
+                                   "primary_renal_failure","primary_copd_bronchitis","primary_stroke_cerebro"),
+                          title = "ICU LOS Distribution by Comorbidity / Primary Diagnosis",
+                          label_map = c(
+                            hypertension             = "Hypertension",
+                            copd_comorb              = "COPD",
+                            sepsis                   = "Sepsis",
+                            diabetes                 = "Diabetes",
+                            ckd                      = "CKD",
+                            pad                      = "PAD",
+                            obesity                  = "Obesity",
+                            smoking                  = "Smoking",
+                            alcohol_use              = "Alcohol Use",
+                            primary_af               = "Primary Dx: AF",
+                            primary_ami              = "Primary Dx: AMI",
+                            primary_hf_cm            = "Primary Dx: HF/CM",
+                            primary_renal_failure    = "Primary Dx: Renal Failure",
+                            primary_copd_bronchitis  = "Primary Dx: COPD/Bronchitis",
+                            primary_stroke_cerebro   = "Primary Dx: Stroke/Cerebro"
+                          )
+)
+
+# Fig4: Medications
+fig4 <- make_ridge_binary(df_vis,
+                          vars = c("acei_arb","anticoagulants","antiplatelets",
+                                   "beta_blockers","long_acting_bronchodilator","nephrotoxic","statins"),
+                          title = "ICU LOS Distribution by Medication Use",
+                          label_map = c(
+                            acei_arb                   = "ACEi / ARB",
+                            anticoagulants             = "Anticoagulants",
+                            antiplatelets              = "Antiplatelets",
+                            beta_blockers              = "Beta-Blockers",
+                            long_acting_bronchodilator = "Long-Acting Bronchodilator",
+                            nephrotoxic                = "Nephrotoxic Agents",
+                            statins                    = "Statins"
+                          )
+)
+
+# Fig5: Interventions
+fig5 <- make_ridge_binary(df_vis,
+                          vars = c("vent_any","vasopressors","norepinephrine",
+                                   "epinephrine","dopamine","vasopressin","CCU_flag","CVICU_flag"),
+                          title = "ICU LOS Distribution by Interventions & Unit Type",
+                          label_map = c(
+                            vent_any       = "Mechanical Ventilation",
+                            vasopressors   = "Any Vasopressor",
+                            norepinephrine = "Norepinephrine",
+                            epinephrine    = "Epinephrine",
+                            dopamine       = "Dopamine",
+                            vasopressin    = "Vasopressin",
+                            CCU_flag       = "CCU",
+                            CVICU_flag     = "CVICU"
+                          )
+)
+
+# Fig6: Missingness
+fig6 <- make_ridge_miss(df_vis, top_n = 20)
+
+# ════════════════════════════════════════════════════════════════════════════
+# SAVE
+# ════════════════════════════════════════════════════════════════════════════
+ggsave("los_fig1_categorical.png",   fig1, width=14, height=11, dpi=180, bg="white")
+ggsave("los_fig2_careunit.png",      fig2, width=12, height=7,  dpi=180, bg="white")
+ggsave("los_fig3_comorbidities.png", fig3, width=12, height=10, dpi=180, bg="white")
+ggsave("los_fig4_medications.png",   fig4, width=12, height=7,  dpi=180, bg="white")
+ggsave("los_fig5_interventions.png", fig5, width=12, height=7,  dpi=180, bg="white")
+ggsave("los_fig6_missingness.png",   fig6, width=12, height=10, dpi=180, bg="white")
+
+cat("✓ los_fig1_categorical.png\n")
+cat("✓ los_fig2_careunit.png\n")
+cat("✓ los_fig3_comorbidities.png\n")
+cat("✓ los_fig4_medications.png\n")
+cat("✓ los_fig5_interventions.png\n")
+cat("✓ los_fig6_missingness.png\n")
+
 
 
 
@@ -205,29 +529,23 @@ wquant_matrix <- function(y_train, W_sparse, probs) {
   n_probs <- length(probs)
   res <- matrix(NA, nrow = n_test, ncol = n_probs)
   
-  # 3. 循环处理每一行（利用稀疏矩阵内部结构）
+  # 3. 转为行压缩格式 (dgRMatrix) 以实现高效逐行访问
+  # 避免 as.matrix() 产生的巨型稠密矩阵（n_test x n_train 可达数GB）
+  W_r <- as(W_sorted, "RsparseMatrix")   # 转为 dgRMatrix，@p 是行指针
+  
   for (i in 1:n_test) {
-    # 提取第 i 行的非零元素
-    row_start <- W_sorted@p[i] + 1
-    row_end   <- W_sorted@p[i+1]
+    row_start <- W_r@p[i] + 1L
+    row_end   <- W_r@p[i + 1L]
     
-    # 如果该行全为 0 (理论上 DRF 不会出现)
-    if (row_start > row_end) next
+    if (row_start > row_end) next   # 空行（理论上不会出现）
     
-    # 获取非零权重的索引和数值
-    # 注意：dgCMatrix 是列压缩，这里如果 W_sorted 是行压缩 (dgRMatrix) 会更快
-    # 但直接使用 W_sorted[i,] 并在其中处理非零值已足够提速
-    row_data <- W_sorted[i, ]
-    nz_idx <- which(row_data != 0)
-    nz_w <- as.numeric(row_data[nz_idx])
-    nz_y <- y_sorted[nz_idx]
+    nz_idx <- W_r@j[row_start:row_end] + 1L   # 0-based -> 1-based 列索引
+    nz_w   <- W_r@x[row_start:row_end]
+    nz_y   <- y_sorted[nz_idx]
     
-    # 计算累积分布
     cw <- cumsum(nz_w) / sum(nz_w)
     
-    # 匹配分位数点
     for (p_idx in 1:n_probs) {
-      # 找到第一个大于等于概率 p 的位置
       idx <- which(cw >= probs[p_idx])[1]
       res[i, p_idx] <- nz_y[idx]
     }
@@ -1390,15 +1708,18 @@ cat("========================================\n")
 cat("MODEL 10: BNN (Bayes by Backprop, Blundell et al. 2015)\n")
 cat("========================================\n")
 
-# ---- Scale mixture prior (Section 3.3, Eq. 7) ----
-log_scale_mixture_prior <- function(w, pi_mix, log_sigma1, log_sigma2) {
-  # log[ pi*N(w;0,exp(2*log_sigma1)) + (1-pi)*N(w;0,exp(2*log_sigma2)) ]
-  # Numerically stable via log-sum-exp
-  log_p1 <- log(pi_mix)  + dnorm(w, mean = 0, sd = exp(log_sigma1), log = TRUE)
-  log_p2 <- log(1 - pi_mix) + dnorm(w, mean = 0, sd = exp(log_sigma2), log = TRUE)
-  # log-sum-exp
-  m  <- pmax(log_p1, log_p2)
-  m + log(exp(log_p1 - m) + exp(log_p2 - m))
+# ---- Scale mixture prior — pure torch, stays on GPU (Section 3.3, Eq. 7) ----
+# w: torch tensor (any shape), all scalar args are R numerics
+torch_log_scale_mixture_prior <- function(w, pi_mix, log_sigma1, log_sigma2) {
+  # log[ pi*N(w;0,s1^2) + (1-pi)*N(w;0,s2^2) ]  — log-sum-exp for stability
+  # All computation on the same device as w; no CPU transfer needed
+  half_log2pi <- 0.5 * log(2 * pi)
+  log_p1 <- log(pi_mix)       - half_log2pi - log_sigma1 -
+    0.5 * (w / exp(log_sigma1))^2
+  log_p2 <- log(1 - pi_mix)   - half_log2pi - log_sigma2 -
+    0.5 * (w / exp(log_sigma2))^2
+  m      <- torch_maximum(log_p1, log_p2)
+  torch_sum(m + torch_log(torch_exp(log_p1 - m) + torch_exp(log_p2 - m)))
 }
 
 # ---- Bayesian linear layer (Section 3.2) ----
@@ -1419,13 +1740,11 @@ bnn_linear <- nn_module(
   },
   forward = function(x) {
     # sigma = log(1 + exp(rho))  — Eq. after Section 3.2 heading
-    w_sigma   <- torch_log1p(torch_exp(self$w_rho))
-    b_sigma   <- torch_log1p(torch_exp(self$b_rho))
+    w_sigma        <- torch_log1p(torch_exp(self$w_rho))
+    b_sigma        <- torch_log1p(torch_exp(self$b_rho))
     # Reparameterisation: w = mu + sigma * epsilon, epsilon~N(0,I)
-    w_epsilon <- torch_randn_like(w_sigma)
-    b_epsilon <- torch_randn_like(b_sigma)
-    self$w_sample <- self$w_mu + w_sigma * w_epsilon
-    self$b_sample <- self$b_mu + b_sigma * b_epsilon
+    self$w_sample  <- self$w_mu + w_sigma * torch_randn_like(w_sigma)
+    self$b_sample  <- self$b_mu + b_sigma * torch_randn_like(b_sigma)
     nnf_linear(x, self$w_sample, self$b_sample)
   },
   # KL divergence term: log q(w|theta) - log P(w)
@@ -1445,14 +1764,13 @@ bnn_linear <- nn_module(
     )
     log_q  <- log_qw + log_qb
     
-    # log P(w): scale mixture prior (Eq. 7)
-    w_vec   <- as.numeric(self$w_sample$to(device = "cpu"))
-    b_vec   <- as.numeric(self$b_sample$to(device = "cpu"))
-    log_pw  <- sum(log_scale_mixture_prior(w_vec, self$pi_mix, self$log_sig1, self$log_sig2))
-    log_pb  <- sum(log_scale_mixture_prior(b_vec, self$pi_mix, self$log_sig1, self$log_sig2))
-    log_p   <- torch_tensor(log_pw + log_pb, dtype = torch_float(), device = device)
+    # log P(w): scale mixture prior — pure torch, no CPU transfer (Eq. 7)
+    log_pw <- torch_log_scale_mixture_prior(
+      self$w_sample$detach(), self$pi_mix, self$log_sig1, self$log_sig2)
+    log_pb <- torch_log_scale_mixture_prior(
+      self$b_sample$detach(), self$pi_mix, self$log_sig1, self$log_sig2)
     
-    log_q - log_p   # KL contribution for this layer's weights
+    log_q - (log_pw + log_pb)   # KL contribution for this layer
   }
 )
 
@@ -1513,18 +1831,18 @@ train_bnn_bbb <- function(X_sc, y_obs, h1, h2, lr,
 # Inference: Thompson sampling (Section 4.1) —
 # sample M_pass weight configurations, average predictions
 bnn_avg_params_bbb <- function(net, X_sc, M_pass = 100) {
-  net$train()  # keep dropout-style stochasticity ON for sampling
+  net$train()  # keep stochasticity ON for Thompson sampling
   X_t   <- torch_tensor(X_sc, dtype = torch_float(), device = device)
-  acc_s <- matrix(0, nrow(X_sc), 1)
-  acc_r <- matrix(0, nrow(X_sc), 1)
+  acc_s <- 0
+  acc_r <- 0
   for (p_i in seq_len(M_pass)) {
     with_no_grad({
-      pm    <- as.matrix(net(X_t)$to(device = "cpu"))
+      pm    <- as.matrix(net(X_t)$cpu())   # [N, 2]
     })
-    acc_s <- acc_s + exp(pm[, 1, drop = FALSE])
-    acc_r <- acc_r + exp(pm[, 2, drop = FALSE])
+    acc_s <- acc_s + exp(pm[, 1])   # standard R matrix indexing, no drop needed
+    acc_r <- acc_r + exp(pm[, 2])
   }
-  list(shape = as.vector(acc_s / M_pass), rate = as.vector(acc_r / M_pass))
+  list(shape = acc_s / M_pass, rate = acc_r / M_pass)
 }
 
 # ---- HP tuning ----
@@ -1625,14 +1943,14 @@ pinball_loss <- function(pred, y_true, tau) {
 
 nn_feat_extractor <- nn_sequential(
   nn_linear(n_input, 128), nn_relu(),
-  nn_linear(128, 64),      nn_relu()
+  nn_linear(128, 32),      nn_relu()
 )
-nn_out_head <- nn_linear(64, n_quantiles)
+nn_out_head <- nn_linear(32, n_quantiles)
 
 nn_feat_extractor$to(device = device)
 nn_out_head$to(device = device)
 
-opt_hyb <- optim_adam(c(nn_feat_extractor$parameters, nn_out_head$parameters), lr = 1e-3)
+opt_hyb <- optim_adam(c(nn_feat_extractor$parameters, nn_out_head$parameters), lr = 5e-5)
 
 dl_hyb <- make_dl(Xtr_ens_sc, y_tr_sc, batch_size = 512)
 
@@ -1797,7 +2115,10 @@ cov_width <- do.call(rbind, lapply(model_names, function(m) {
   r <- eval_interval(all_q[[m]], y_te)
   data.frame(Model = m, Coverage = r$coverage, Width = r$width)
 }))
-cat("Coverage & Width:\n"); print(round(cov_width, 4))
+
+cat("Coverage & Width:\n")
+cov_width[, c("Coverage", "Width")] <- round(cov_width[, c("Coverage", "Width")], 4)
+print(cov_width)
 
 # WIS
 wis_vec <- sapply(model_names, function(m) wis_score(all_q[[m]], y_te))
