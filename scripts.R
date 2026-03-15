@@ -1795,11 +1795,25 @@ nll_vec <- sapply(model_names, function(m) {
 })
 cat("\nNLL (lower = better, NA = XGB/conformal):\n"); print(round(nll_vec, 4))
 
+# MAE & RMSE (based on median prediction q50)
+mae_vec <- sapply(model_names, function(m) {
+  q50 <- all_q[[m]]$q50
+  mean(abs(y_te - q50), na.rm = TRUE)
+})
+rmse_vec <- sapply(model_names, function(m) {
+  q50 <- all_q[[m]]$q50
+  sqrt(mean((y_te - q50)^2, na.rm = TRUE))
+})
+cat("\nMAE (lower = better):\n");  print(round(mae_vec,  4))
+cat("\nRMSE (lower = better):\n"); print(round(rmse_vec, 4))
+
 # Summary table
 summary_all <- data.frame(
   Model    = model_names,
   Coverage = cov_width$Coverage,
   Width    = cov_width$Width,
+  MAE      = mae_vec,
+  RMSE     = rmse_vec,
   WIS      = wis_vec,
   CRPS     = crps_vec,
   NLL      = nll_vec
