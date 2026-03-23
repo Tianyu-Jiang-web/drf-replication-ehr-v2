@@ -503,6 +503,29 @@ cat("  Removed useless *_miss (all-zero in train):", length(miss_all_zero), "\n"
 cat("  Removed constant columns (in train):", length(const_cols), "\n")
 cat("  Xtr_tree cols:", ncol(Xtr_tree), " | Xte_tree cols:", ncol(Xte_tree), "\n")
 
+# ---------------------------------------------------------
+# 5b) 同样清理 all (QRF) features — 以 train 为准
+# ---------------------------------------------------------
+miss_cols_all <- grep("_miss$", names(Xtr_all), value = TRUE)
+
+miss_all_zero_all <- miss_cols_all[
+  sapply(miss_cols_all, function(v) sum(Xtr_all[[v]], na.rm = TRUE) == 0)
+]
+
+const_cols_all <- names(Xtr_all)[
+  sapply(Xtr_all, function(x) dplyr::n_distinct(x, na.rm = TRUE) <= 1)
+]
+
+drop_cols_all <- union(miss_all_zero_all, const_cols_all)
+
+Xtr_all <- Xtr_all %>% select(-any_of(drop_cols_all))
+Xte_all <- Xte_all %>% select(-any_of(drop_cols_all))
+
+cat("All (QRF) feature cleanup:\n")
+cat("  Removed useless *_miss (all-zero in train):", length(miss_all_zero_all), "\n")
+cat("  Removed constant columns (in train):", length(const_cols_all), "\n")
+cat("  Xtr_all cols:", ncol(Xtr_all), " | Xte_all cols:", ncol(Xte_all), "\n")
+
 
 # For hyperparameter tuning
 library(caret)
@@ -810,15 +833,25 @@ pinball_loss_grid <- function(pred, y_true, tau_t) {
 # SHARED: Dataset / DataLoader builder
 # ============================================================
 make_dl <- function(X_sc, y_obs, batch_size = 512) {
-  ds_def <- dataset(
-    name       = "qr_ds",
-    initialize = function(X, y) { self$X <- X; self$y <- y },
-    .getitem   = function(i)    list(x = self$X[i, ], y = self$y[i]),
-    .length    = function()     nrow(self$X)
+  X_t <- torch_tensor(
+    as.matrix(X_sc),
+    dtype = torch_float(),
+    device = device
   )
-  X_t <- torch_tensor(X_sc,                    dtype = torch_float(), device = device)
-  y_t <- torch_tensor(matrix(y_obs, ncol = 1), dtype = torch_float(), device = device)
-  dataloader(ds_def(X_t, y_t), batch_size = batch_size, shuffle = TRUE)
+  
+  y_t <- torch_tensor(
+    matrix(as.numeric(y_obs), ncol = 1),
+    dtype = torch_float(),
+    device = device
+  )
+  
+  ds <- tensor_dataset(X_t, y_t)
+  
+  dataloader(
+    ds,
+    batch_size = batch_size,
+    shuffle = TRUE
+  )
 }
 
 # ============================================================
@@ -871,10 +904,14 @@ train_qr_dnn <- function(X_sc, y_obs, h1, h2, lr, epochs = 60, batch_size = 512)
   net$train()
   for (ep in seq_len(epochs)) {
     coro::loop(for (b in dl) {
+      x_batch <- b[[1]]
+      y_batch <- b[[2]]
+      
       optim$zero_grad()
-      pred <- net(b$x)
-      loss <- pinball_loss_grid(pred, b$y, tau_t)
-      loss$backward(); optim$step()
+      pred <- net(x_batch)
+      loss <- pinball_loss_grid(pred, y_batch, tau_t)
+      loss$backward()
+      optim$step()
     })
   }
   net$eval(); net
@@ -966,27 +1003,42 @@ train_qr_dropout_dnn <- function(X_sc, y_obs, p_drop, lr,
   net   <- make_qr_dropout_dnn(n_input, h1, h2, p_drop)$to(device = device)
   optim <- optim_adam(net$parameters, lr = lr)
   dl    <- make_dl(X_sc, y_obs, batch_size)
+  
   net$train()
   for (ep in seq_len(epochs)) {
     coro::loop(for (b in dl) {
+      x_batch <- b[[1]]
+      y_batch <- b[[2]]
+      
       optim$zero_grad()
-      pred <- net(b$x)
-      loss <- pinball_loss_grid(pred, b$y, tau_t)
-      loss$backward(); optim$step()
+      pred <- net(x_batch)
+      loss <- pinball_loss_grid(pred, y_batch, tau_t)
+      loss$backward()
+      optim$step()
     })
   }
-  net  # leave in train() mode so dropout stays active at inference
+  
+  net   # keep in train mode for MC dropout inference
 }
 
 mcd_avg_quantiles <- function(net, X_sc, M_pass = 50) {
+  X_sc <- as.matrix(X_sc)
   net$train()  # keep dropout ON
-  X_t    <- torch_tensor(X_sc, dtype = torch_float(), device = device)
-  acc_q  <- matrix(0, nrow(X_sc), n_quantiles)
+  
+  X_t <- torch_tensor(
+    X_sc,
+    dtype = torch_float(),
+    device = device
+  )
+  
+  acc_q <- matrix(0, nrow(X_sc), n_quantiles)
+  
   with_no_grad({
     for (p in seq_len(M_pass)) {
       acc_q <- acc_q + as.matrix(net(X_t)$cpu())
     }
   })
+  
   acc_q / M_pass
 }
 
@@ -1076,6 +1128,7 @@ gamma_nll_loss <- function(params, y_true) {
   torch_mean(nll)
 }
 get_gamma_params <- function(net, X_sc) {
+  X_sc <- as.matrix(X_sc)
   net$eval()
   Xv <- torch_tensor(X_sc, dtype = torch_float(), device = device)
   with_no_grad({
@@ -1112,19 +1165,22 @@ train_ddnn <- function(X_tr, y_tr_in, X_va, y_va, h1, h2, lr,
   optim <- optim_adam(net$parameters, lr = lr)
   dl    <- make_dl(X_tr, y_tr_in, batch_size)
   
-  Xva_t <- torch_tensor(X_va, dtype = torch_float(), device = device)
-  yva_t <- torch_tensor(matrix(y_va, ncol = 1), dtype = torch_float(), device = device)
+  Xva_t <- torch_tensor(as.matrix(X_va), dtype = torch_float(), device = device)
+  yva_t <- torch_tensor(matrix(as.numeric(y_va), ncol = 1), dtype = torch_float(), device = device)
   
   best_val_nll <- Inf; best_state <- NULL; patience_cnt <- 0
   
   net$train()
   for (ep in seq_len(max_epochs)) {
     coro::loop(for (b in dl) {
-      optim$zero_grad()
-      params <- net(b$x)
-      nll    <- gamma_nll_loss(params, b$y)
+      x_batch <- b[[1]]
+      y_batch <- b[[2]]
       
-      l1_pen <- torch_tensor(0.0, device = device)
+      optim$zero_grad()
+      params <- net(x_batch)
+      nll    <- gamma_nll_loss(params, y_batch)
+      
+      l1_pen <- torch_tensor(0.0, dtype = torch_float(), device = device)
       if (l1_hidden > 0) {
         for (nm in names(net$parameters)) {
           if (grepl("^[0-9]+\\.weight$", nm) && !grepl("^[56789]", nm)) {
@@ -1132,8 +1188,10 @@ train_ddnn <- function(X_tr, y_tr_in, X_va, y_va, h1, h2, lr,
           }
         }
       }
+      
       loss <- nll + l1_pen
-      loss$backward(); optim$step()
+      loss$backward()
+      optim$step()
     })
     
     # 早停：val NLL
@@ -1474,14 +1532,19 @@ train_bnn_bbb_np <- function(X_sc, y_obs, h1, h2, lr,
   for (ep in seq_len(epochs)) {
     batch_cnt <- 0L
     coro::loop(for (b in dl) {
-      batch_cnt  <- batch_cnt + 1L
-      pi_i       <- kl_weights[min(batch_cnt, n_batches)]
+      batch_cnt <- batch_cnt + 1L
+      pi_i      <- kl_weights[min(batch_cnt, n_batches)]
+      
+      x_batch <- b[[1]]
+      y_batch <- b[[2]]
+      
       opt$zero_grad()
-      pred       <- net(b$x)
-      pb_loss    <- pinball_loss_grid(pred, b$y, tau_t)
+      pred       <- net(x_batch)
+      pb_loss    <- pinball_loss_grid(pred, y_batch, tau_t)
       kl_contrib <- net$kl()
-      loss <- pi_i * kl_contrib + pb_loss
-      loss$backward(); opt$step()
+      loss       <- pi_i * kl_contrib + pb_loss
+      loss$backward()
+      opt$step()
     })
     if (ep %% 25 == 0)
       cat(sprintf("    Epoch %d/%d\n", ep, epochs))
@@ -1492,15 +1555,19 @@ train_bnn_bbb_np <- function(X_sc, y_obs, h1, h2, lr,
 
 # Thompson sampling for BNN inference (quantile predictions)
 bnn_avg_quantiles <- function(net, X_sc, M_pass = 100) {
+  X_sc <- as.matrix(X_sc)
   net$train()  # keep stochasticity ON
-  X_t    <- torch_tensor(X_sc, dtype = torch_float(), device = device)
-  acc_q  <- matrix(0, nrow(X_sc), n_quantiles)
+  
+  X_t <- torch_tensor(X_sc, dtype = torch_float(), device = device)
+  acc_q <- matrix(0, nrow(X_sc), n_quantiles)
+  
   for (p_i in seq_len(M_pass)) {
     with_no_grad({
-      pm    <- as.matrix(net(X_t)$cpu())
+      pm <- as.matrix(net(X_t)$cpu())
     })
     acc_q <- acc_q + pm
   }
+  
   acc_q / M_pass
 }
 
@@ -1591,7 +1658,8 @@ cat("========================================\n")
 cat("Stage 1: Training neural feature extractor (QRNN, 150 epochs)...\n")
 set.seed(2026)
 
-y_mean_ens  <- mean(y_tr);  y_sd_ens <- sd(y_tr)
+y_mean_ens  <- mean(y_tr)
+y_sd_ens    <- sd(y_tr)
 y_tr_sc     <- (y_tr - y_mean_ens) / y_sd_ens
 
 pinball_loss <- function(pred, y_true, tau) {
@@ -1609,35 +1677,50 @@ nn_out_head <- nn_linear(32, n_quantiles)
 nn_feat_extractor$to(device = device)
 nn_out_head$to(device = device)
 
-opt_hyb <- optim_adam(c(nn_feat_extractor$parameters, nn_out_head$parameters), lr = 5e-5)
+opt_hyb <- optim_adam(
+  c(nn_feat_extractor$parameters, nn_out_head$parameters),
+  lr = 5e-5
+)
 
 dl_hyb <- make_dl(Xtr_ens_sc, y_tr_sc, batch_size = 512)
 
-nn_feat_extractor$train(); nn_out_head$train()
+nn_feat_extractor$train()
+nn_out_head$train()
+
 for (epoch in seq_len(150)) {
   coro::loop(for (b in dl_hyb) {
+    x_batch <- b[[1]]
+    y_batch <- b[[2]]
+    
     opt_hyb$zero_grad()
-    feats <- nn_feat_extractor(b$x)
+    feats <- nn_feat_extractor(x_batch)
     preds <- nn_out_head(feats)
-    loss  <- pinball_loss(preds, b$y, tau_t$to(device = device))
-    loss$backward(); opt_hyb$step()
+    loss  <- pinball_loss(preds, y_batch, tau_t)
+    loss$backward()
+    opt_hyb$step()
   })
-  if (epoch %% 50 == 0)
-    cat(sprintf("    Epoch %d, Loss: %.4f\n", epoch, as.numeric(loss)))
+  
+  if (epoch %% 50 == 0) {
+    cat(sprintf("    Epoch %d, Loss: %.4f\n", epoch, as.numeric(loss$item())))
+  }
 }
 cat("  Feature extractor training complete.\n\n")
 
 cat("Stage 2: Extracting 32-dim neural features...\n")
 nn_feat_extractor$eval()
-X_tr_t <- torch_tensor(Xtr_ens_sc, dtype = torch_float(), device = device)
-X_te_t <- torch_tensor(Xte_ens_sc, dtype = torch_float(), device = device)
+
+X_tr_t <- torch_tensor(as.matrix(Xtr_ens_sc), dtype = torch_float(), device = device)
+X_te_t <- torch_tensor(as.matrix(Xte_ens_sc), dtype = torch_float(), device = device)
+
 with_no_grad({
-  neural_tr <- as.matrix(nn_feat_extractor(X_tr_t))
-  neural_te <- as.matrix(nn_feat_extractor(X_te_t))
+  neural_tr <- as.matrix(nn_feat_extractor(X_tr_t)$cpu())
+  neural_te <- as.matrix(nn_feat_extractor(X_te_t)$cpu())
 })
+
 colnames(neural_tr) <- colnames(neural_te) <- paste0("nn_feat_", seq_len(ncol(neural_tr)))
 df_neural_tr <- as.data.frame(neural_tr)
 df_neural_te <- as.data.frame(neural_te)
+
 cat(sprintf("  Features: %d train x %d dims,  %d test x %d dims\n",
             nrow(df_neural_tr), ncol(df_neural_tr), nrow(df_neural_te), ncol(df_neural_te)))
 
@@ -1653,15 +1736,18 @@ hybrid_drf <- drf(
 )
 
 cat("Stage 4: Computing Hybrid predictions (wquant_matrix)...\n")
-hybrid_pred   <- predict(hybrid_drf, newdata = df_neural_te)
+hybrid_pred      <- predict(hybrid_drf, newdata = df_neural_te)
 hybrid_qgrid_mat <- wquant_matrix(as.numeric(hybrid_pred$y), hybrid_pred$weights, q_grid)
-lower_hyb     <- min(y_tr)
+lower_hyb        <- min(y_tr)
 hybrid_qgrid_mat <- pmax(hybrid_qgrid_mat, lower_hyb)
 
-hybrid_q      <- data.frame(q05 = hybrid_qgrid_mat[, q05_idx],
-                            q50 = hybrid_qgrid_mat[, q50_idx],
-                            q95 = hybrid_qgrid_mat[, q95_idx])
-hybrid_qgrid  <- as.data.frame(hybrid_qgrid_mat)
+hybrid_q <- data.frame(
+  q05 = hybrid_qgrid_mat[, q05_idx],
+  q50 = hybrid_qgrid_mat[, q50_idx],
+  q95 = hybrid_qgrid_mat[, q95_idx]
+)
+
+hybrid_qgrid <- as.data.frame(hybrid_qgrid_mat)
 colnames(hybrid_qgrid) <- paste0("q", sprintf("%02d", round(100 * q_grid)))
 cat("Hybrid NN+DRF complete.\n\n")
 
