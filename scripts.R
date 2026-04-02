@@ -2047,7 +2047,12 @@ subgroup_crps_table <- function(df, group_var) {
 
 
 # ============================================================
-# HETEROGENEITY ANALYSIS (subgroup CRPS, req. 4)
+# HETEROGENEITY ANALYSIS (subgroup CRPS)
+# Subgroups selected based on clinical prior knowledge:
+# interventions (vasopressin, vasopressors, ventilation),
+# diagnoses (sepsis, stroke), care unit, and age group.
+# LOS severity removed (outcome-based subgrouping = circular).
+# Missingness subgroups removed (data quality, not clinical heterogeneity).
 # ============================================================
 cat("\n========================================\n")
 cat("HETEROGENEITY ANALYSIS (CRPS-based subgroups)\n")
@@ -2062,17 +2067,28 @@ if ("vasopressin" %in% names(Xte_tree)) {
   cat("\n=== CRPS by Vasopressin Subgroup ===\n"); print(out_vasopressin_crps)
 } else {
   out_vasopressin_crps <- NULL
+  cat("\n(vasopressin not found in test features)\n")
 }
 
 # ---- Subgroup 2: Any Vasopressor use ----
-eval_df$vaso_group <- factor(Xte_tree$vasopressors, 0:1, c("No Vasopressors", "Vasopressors"))
-out_vaso_crps <- subgroup_crps_table(eval_df, "vaso_group")
-cat("\n=== CRPS by Any Vasopressor Subgroup ===\n"); print(out_vaso_crps)
+if ("vasopressors" %in% names(Xte_tree)) {
+  eval_df$vaso_group <- factor(Xte_tree$vasopressors, 0:1, c("No Vasopressors", "Vasopressors"))
+  out_vaso_crps <- subgroup_crps_table(eval_df, "vaso_group")
+  cat("\n=== CRPS by Any Vasopressor Subgroup ===\n"); print(out_vaso_crps)
+} else {
+  out_vaso_crps <- NULL
+  cat("\n(vasopressors not found in test features)\n")
+}
 
 # ---- Subgroup 3: Mechanical Ventilation ----
-eval_df$vent_group <- factor(Xte_tree$vent_any, 0:1, c("No Ventilation", "Ventilated"))
-out_vent_crps <- subgroup_crps_table(eval_df, "vent_group")
-cat("\n=== CRPS by Mechanical Ventilation Subgroup ===\n"); print(out_vent_crps)
+if ("vent_any" %in% names(Xte_tree)) {
+  eval_df$vent_group <- factor(Xte_tree$vent_any, 0:1, c("No Ventilation", "Ventilated"))
+  out_vent_crps <- subgroup_crps_table(eval_df, "vent_group")
+  cat("\n=== CRPS by Mechanical Ventilation Subgroup ===\n"); print(out_vent_crps)
+} else {
+  out_vent_crps <- NULL
+  cat("\n(vent_any not found in test features)\n")
+}
 
 # ---- Subgroup 4: Sepsis ----
 if ("sepsis" %in% names(Xte_tree)) {
@@ -2110,217 +2126,452 @@ if ("first_careunit" %in% names(Xte_tree)) {
   out_unit_crps <- subgroup_crps_table(
     eval_df %>% filter(!is.na(unit_group_raw)), "unit_group_raw"
   )
-  cat("\n=== CRPS by ICU Care Unit (raw, n>=200 only) ===\n"); print(out_unit_crps)
+  cat("\n=== CRPS by ICU Care Unit (n>=200 only) ===\n"); print(out_unit_crps)
 } else {
   out_unit_crps <- NULL
   cat("\n(first_careunit not found in test features)\n")
 }
 
-# ---- Subgroup 7: LOS severity ----
-out_los_crps <- subgroup_crps_table(eval_df, "los_group")
-cat("\n=== CRPS by LOS Severity Subgroup ===\n"); print(out_los_crps)
-
-# ---- Subgroup 8: Per-variable missingness ----
-cat("\n=== CRPS by Per-Variable Missingness (Fig6-informed) ===\n")
-
-get_miss_col <- function(base_name, feature_df) {
-  candidates <- c(paste0(base_name, "_miss"),
-                  paste0(base_name, "_final_miss"),
-                  paste0(base_name, "_miss_final"))
-  found <- intersect(candidates, names(feature_df))
-  if (length(found) > 0) found[1] else NULL
-}
-
-miss_selected <- list(
-  list(base = "temp",          label = "Body Temp",
-       interpretation = "Missing = not on ICU monitoring; shorter LOS"),
-  list(base = "icu_sbp_last24h", label = "SBP last 24h",
-       interpretation = "Missing = no arterial line; lower acuity patients"),
-  list(base = "Albumin",       label = "Albumin",
-       interpretation = "Missing = routine labs not ordered; shorter LOS")
-)
-
-out_miss_var_list <- list()
-for (ms in miss_selected) {
-  miss_col <- get_miss_col(ms$base, Xte_tree)
-  if (is.null(miss_col)) {
-    cat(sprintf("\n  (%s missingness column not found — skipping)\n", ms$label)); next
-  }
-  vals   <- Xte_tree[[miss_col]]
-  n_miss <- sum(vals == 1, na.rm = TRUE)
-  n_obs  <- sum(vals == 0, na.rm = TRUE)
-  if (n_miss < 30 || n_obs < 30) {
-    cat(sprintf("\n  (%s: n_miss=%d or n_obs=%d too small — skipping)\n",
-                ms$label, n_miss, n_obs)); next
-  }
-  grp_col <- paste0("miss_grp_", ms$base)
-  eval_df[[grp_col]] <- factor(
-    vals, 0:1,
-    labels = c(paste0(ms$label, " Observed (n=", n_obs, ")"),
-               paste0(ms$label, " Missing (n=",  n_miss, ")"))
+# ---- Subgroup 7: Age Group ----
+# Clinically motivated cut-points: <65 (non-elderly), 65-80 (elderly), >80 (oldest-old)
+# Older patients have greater physiological complexity and more variable LOS distributions
+if ("anchor_age" %in% names(Xte_tree)) {
+  eval_df$age_group <- cut(
+    Xte_tree$anchor_age,
+    breaks = c(-Inf, 65, 80, Inf),
+    labels = c("<65", "65-80", ">80"),
+    right  = TRUE
   )
-  crps_tbl <- subgroup_crps_table(eval_df, grp_col)
-  out_miss_var_list[[ms$base]] <- crps_tbl
-  cat(sprintf("\n--- CRPS by %s missingness  [%s] ---\n",
-              ms$label, ms$interpretation))
-  print(crps_tbl)
+  age_counts <- table(eval_df$age_group)
+  cat(sprintf("\nAge group distribution in test set:\n")); print(age_counts)
+  out_age_crps <- subgroup_crps_table(eval_df, "age_group")
+  cat("\n=== CRPS by Age Group Subgroup ===\n"); print(out_age_crps)
+} else {
+  out_age_crps <- NULL
+  cat("\n(anchor_age not found in test features)\n")
 }
 
+# ============================================================
+# FAIRNESS ANALYSIS (subgroup CRPS by protected attributes)
+# Examines whether UQ performance differs systematically
+# across sociodemographic groups (gender, race, insurance).
+# Uses the same CRPS subgroup framework as heterogeneity
+# analysis but interpreted through a health equity lens.
+# ============================================================
+cat("\n========================================\n")
+cat("FAIRNESS ANALYSIS (CRPS by protected attributes)\n")
+cat("========================================\n\n")
 
+# ---- Fairness 1: Gender ----
+if ("gender" %in% names(Xte_tree)) {
+  gender_vals <- trimws(as.character(Xte_tree$gender))
+  gender_vals[gender_vals == "" | gender_vals == "Unknown"] <- NA_character_
+  valid_genders <- names(table(gender_vals)[table(gender_vals) >= 50])
+  eval_df$gender_group <- factor(
+    ifelse(gender_vals %in% valid_genders, gender_vals, NA_character_),
+    levels = valid_genders
+  )
+  cat(sprintf("\nGender distribution in test set:\n"))
+  print(table(eval_df$gender_group, useNA = "ifany"))
+  out_gender_crps <- subgroup_crps_table(
+    eval_df %>% filter(!is.na(gender_group)), "gender_group"
+  )
+  cat("\n=== CRPS by Gender ===\n"); print(out_gender_crps)
+} else {
+  out_gender_crps <- NULL
+  cat("\n(gender not found in test features)\n")
+}
+
+# ---- Fairness 2: Race / Ethnicity ----
+if ("race_clean" %in% names(Xte_tree)) {
+  race_vals <- trimws(as.character(Xte_tree$race_clean))
+  race_vals[race_vals == "" | race_vals == "Unknown"] <- NA_character_
+  valid_races <- names(table(race_vals)[table(race_vals) >= 50])
+  eval_df$race_group <- factor(
+    ifelse(race_vals %in% valid_races, race_vals, NA_character_),
+    levels = valid_races
+  )
+  cat(sprintf("\nRace/Ethnicity distribution in test set:\n"))
+  print(table(eval_df$race_group, useNA = "ifany"))
+  out_race_crps <- subgroup_crps_table(
+    eval_df %>% filter(!is.na(race_group)), "race_group"
+  )
+  cat("\n=== CRPS by Race/Ethnicity ===\n"); print(out_race_crps)
+} else {
+  out_race_crps <- NULL
+  cat("\n(race_clean not found in test features)\n")
+}
+
+# ---- Fairness 3: Insurance Type ----
+# Insurance type is a proxy for socioeconomic status in the US healthcare context
+if ("insurance" %in% names(Xte_tree)) {
+  ins_vals <- trimws(as.character(Xte_tree$insurance))
+  ins_vals[ins_vals == "" | ins_vals == "Unknown"] <- NA_character_
+  valid_ins <- names(table(ins_vals)[table(ins_vals) >= 50])
+  eval_df$insurance_group <- factor(
+    ifelse(ins_vals %in% valid_ins, ins_vals, NA_character_),
+    levels = valid_ins
+  )
+  cat(sprintf("\nInsurance type distribution in test set:\n"))
+  print(table(eval_df$insurance_group, useNA = "ifany"))
+  out_insurance_crps <- subgroup_crps_table(
+    eval_df %>% filter(!is.na(insurance_group)), "insurance_group"
+  )
+  cat("\n=== CRPS by Insurance Type ===\n"); print(out_insurance_crps)
+} else {
+  out_insurance_crps <- NULL
+  cat("\n(insurance not found in test features)\n")
+}
 # ============================================================
 # CALIBRATION PLOTS (req. 4: removed density distribution, WIS, KS, KL)
 # ============================================================
 library(ggplot2); library(scales)
 
-# ---- Conditional calibration ----
-K <- 10
+
+# PIT plot
+# ---- 对每个模型计算 PIT 值 ----
+pit_df <- bind_rows(lapply(names(all_qgrid), function(m) {
+  qmat <- as.matrix(all_qgrid[[m]])
+  
+  pit_vals <- sapply(seq_len(nrow(qmat)), function(i) {
+    q_vals <- qmat[i, ]
+    y_i    <- y_te[i]
+    
+    if (any(is.na(q_vals)) || any(is.infinite(q_vals))) return(NA_real_)
+    
+    # 保留你原来的尾部截断逻辑
+    if (y_i <= q_vals[1]) return(q_grid[1])
+    if (y_i >= q_vals[length(q_vals)]) return(q_grid[length(q_vals)])
+    
+    idx <- findInterval(y_i, q_vals)
+    
+    if (idx < 1) idx <- 1
+    if (idx >= length(q_vals)) idx <- length(q_vals) - 1
+    
+    p_lo <- q_grid[idx]
+    p_hi <- q_grid[idx + 1]
+    q_lo <- q_vals[idx]
+    q_hi <- q_vals[idx + 1]
+    
+    if (q_hi == q_lo) return((p_lo + p_hi) / 2)
+    
+    p_lo + (y_i - q_lo) / (q_hi - q_lo) * (p_hi - p_lo)
+  })
+  
+  data.frame(
+    model = m,
+    pit   = pit_vals
+  )
+}))
+
+# ---- transformed PIT ----
+eps <- 1e-6
+
+pit_df <- pit_df %>%
+  filter(!is.na(pit)) %>%
+  mutate(
+    pit_clipped = pmin(pmax(pit, eps), 1 - eps),
+    x_trans     = qnorm(pit_clipped)
+  )
+
+# ---- 统一模型顺序（可选）----
+pit_df$model <- factor(pit_df$model, levels = names(all_qgrid))
+
+# ============================================================
+# 图1：PIT histogram
+# ============================================================
+p_pit <- ggplot(pit_df, aes(x = pit)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 20,
+    fill = "grey85",
+    color = "grey20",
+    linewidth = 0.3
+  ) +
+  geom_hline(
+    yintercept = 1,
+    linetype = "dashed",
+    color = "firebrick",
+    linewidth = 0.5
+  ) +
+  facet_wrap(~model, ncol = 2) +
+  scale_x_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.2),
+    expand = c(0.01, 0.01)
+  ) +
+  labs(
+    title = "PIT Histograms",
+    subtitle = "A well-calibrated model should produce an approximately uniform PIT distribution",
+    x = "PIT",
+    y = "Density"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey30"),
+    strip.background = element_rect(fill = "grey95", color = "grey70"),
+    strip.text = element_text(face = "bold", size = 10),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.spacing = unit(0.9, "lines"),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(color = "black")
+  )
+
+p_pit
+
+ggsave(
+  file.path(out_dir, "pit_histogram.png"),
+  plot   = p_pit,
+  width  = 14,
+  height = ceiling(length(model_names) / 2) * 3.2,
+  dpi    = 300
+)
+cat("✓ Saved: pit_histogram.png\n")
+
+# ============================================================
+# 图2：Transformed PIT histogram
+# ============================================================
+p_trans <- ggplot(pit_df, aes(x = x_trans)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 20,
+    fill = "grey85",
+    color = "grey20",
+    linewidth = 0.3
+  ) +
+  stat_function(
+    fun = dnorm,
+    color = "black",
+    linewidth = 0.6
+  ) +
+  facet_wrap(~model, ncol = 2) +
+  scale_x_continuous(
+    limits = c(-3.5, 3.5),
+    breaks = seq(-3, 3, by = 1),
+    expand = c(0.01, 0.01)
+  ) +
+  labs(
+    title = "Transformed PIT Histograms",
+    subtitle = "If PIT is uniform, the transformed values should approximately follow a standard normal distribution",
+    x = "Transformed PIT  (qnorm(PIT))",
+    y = "Density"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey30"),
+    strip.background = element_rect(fill = "grey95", color = "grey70"),
+    strip.text = element_text(face = "bold", size = 10),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.spacing = unit(0.9, "lines"),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(color = "black")
+  )
+
+p_trans
+
+ggsave(
+  file.path(out_dir, "transformed_pit_histogram.png"),
+  plot   = p_trans,
+  width  = 14,
+  height = ceiling(length(model_names) / 2) * 3.2,
+  dpi    = 300
+)
+cat("✓ Saved: transformed_pit_histogram.png\n")
+
+
+
+
+# ============================================================
+# 3. Coverage Calibration Plot（单图，全局对比）
+#    原名 "Reliability Diagram" → 改名 "Coverage Calibration Plot"
+#
+#    MCE 嵌入图例标签（"DRF  [MCE=0.021]"），
+#    图例按 MCE 从小到大排序，兼顾全局对比与个体校准误差读取。
+# ============================================================
+rel_df <- bind_rows(lapply(names(all_qgrid), function(m) {
+  qmat <- as.matrix(all_qgrid[[m]])
+  emp_cov <- sapply(seq_along(alpha_levels), function(j) {
+    mean(y_te <= qmat[, j], na.rm = TRUE)
+  })
+  data.frame(model = m, nominal = alpha_levels, empirical = emp_cov)
+}))
+
+# --- 计算 MCE ---
+rel_df <- rel_df %>%
+  mutate(model = factor(model, levels = model_names))
+
+mce_df <- rel_df %>%
+  group_by(model) %>%
+  summarise(
+    MCE = mean(abs(empirical - nominal), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(MCE) %>%                                        # 按 MCE 升序
+  mutate(
+    legend_label = sprintf("%-14s [MCE=%.3f]", as.character(model), MCE)
+  )
+
+# 把 legend_label 合并回 rel_df，并以 MCE 升序作为图例顺序
+rel_df <- rel_df %>%
+  left_join(mce_df, by = "model") %>%
+  mutate(
+    model_leg = factor(legend_label, levels = mce_df$legend_label)
+  )
+
+# MODEL_COLOR 需要映射到新的 legend_label key
+leg_colors <- setNames(MODEL_COLOR[as.character(mce_df$model)], mce_df$legend_label)
+
+p_cov_cal <- ggplot(rel_df, aes(x = nominal, y = empirical)) +
+  
+  # (i) Perfect calibration diagonal
+  geom_abline(
+    slope = 1, intercept = 0,
+    linetype = "dashed", color = "grey40", linewidth = 0.6
+  ) +
+  
+  # (iii) Model lines — 图例标签含 MCE
+  geom_line(aes(color = model_leg), linewidth = 0.85) +
+  geom_point(aes(color = model_leg), size = 1.8) +
+  
+  scale_color_manual(
+    values = leg_colors,
+    name   = "Model  [MCE ↑ = worse]"         # 图例标题提示排序含义
+  ) +
+  
+  scale_x_continuous(
+    breaks = seq(0.1, 0.9, by = 0.1),
+    labels = scales::percent_format(accuracy = 1),
+    expand = c(0.01, 0.01)
+  ) +
+  scale_y_continuous(
+    breaks = seq(0.1, 0.9, by = 0.1),
+    labels = scales::percent_format(accuracy = 1),
+    expand = c(0.01, 0.01),
+    limits = c(0, 1)
+  ) +
+  
+  labs(
+    title    = "Coverage Calibration Plot",
+    subtitle = paste0(
+      "Dashed diagonal = perfect calibration  |  ",
+      "MCE = Mean Calibration Error (averaged over all quantile levels)  |  ",
+      "Legend ordered best \u2192 worst"
+    ),
+    x = "Nominal quantile level",
+    y = "Empirical coverage"
+  ) +
+  
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 13),
+    plot.subtitle   = element_text(size = 8.5, color = "grey35"),
+    legend.position = "right",
+    legend.title    = element_text(size = 9, face = "bold"),
+    legend.text     = element_text(size = 8.5, family = "mono"),  # 等宽字体对齐
+    legend.key.height = unit(1.1, "lines"),
+    panel.grid.minor  = element_blank(),
+    panel.grid.major  = element_line(color = "#EEEEEE"),
+    axis.title        = element_text(size = 10)
+  )
+
+print(p_cov_cal)
+
+ggsave(
+  file.path(out_dir, "coverage_calibration_plot.png"),
+  plot   = p_cov_cal,
+  width  = 11,
+  height = 7,
+  dpi    = 300
+)
+cat("✓ Saved: coverage_calibration_plot.png\n")
+
+# ---- Conditional calibration by PI width quintile ----
+K <- 10  # 改成5组，对应 HRF 论文的 Q1-Q5
+
 cal_df <- bind_rows(lapply(names(all_q), function(m) {
   eval_df %>%
     transmute(model = m, y,
               q05 = all_q[[m]]$q05,
-              q50 = all_q[[m]]$q50,
               q95 = all_q[[m]]$q95)
 })) %>%
-  mutate(x = q50, covered = (y >= q05) & (y <= q95)) %>%
+  mutate(
+    width   = q95 - q05,                          # ← 改：用PI宽度替代预测中位数
+    covered = (y >= q05) & (y <= q95)
+  ) %>%
   group_by(model) %>%
-  mutate(bin = ntile(x, K)) %>%
+  mutate(bin = ntile(width, K)) %>%               # ← 改：按宽度分五分位
   group_by(model, bin) %>%
-  summarise(x = mean(x, na.rm=TRUE), coverage = mean(covered, na.rm=TRUE),
-            n_bin = n(), .groups="drop") %>%
-  mutate(se    = sqrt(coverage*(1-coverage)/n_bin),
-         lower = pmax(0, coverage-1.96*se),
-         upper = pmin(1, coverage+1.96*se),
-         model = factor(model, levels = model_names))
+  summarise(
+    x        = mean(width, na.rm = TRUE),          # ← 改：x轴是该bin的平均宽度
+    coverage = mean(covered, na.rm = TRUE),
+    n_bin    = n(),
+    .groups  = "drop"
+  ) %>%
+  mutate(
+    se    = sqrt(coverage * (1 - coverage) / n_bin),
+    lower = pmax(0, coverage - 1.96 * se),
+    upper = pmin(1, coverage + 1.96 * se),
+    model = factor(model, levels = model_names),
+    bin_label = factor(paste0("Q", bin),           # ← 新增：给x轴打Q1-Q5标签
+                       levels = paste0("Q", 1:K))
+  )
 
-p_cal <- ggplot(cal_df, aes(x=x, y=coverage)) +
-  geom_hline(yintercept=0.90, linetype="dashed", color="red", alpha=0.6) +
-  geom_ribbon(aes(ymin=lower, ymax=upper), fill="steelblue", alpha=0.15) +
-  geom_line(color="steelblue", linewidth=0.8) +
-  geom_point(color="steelblue", size=1.5, alpha=0.8) +
-  facet_wrap(~model, ncol=2) +
-  scale_y_continuous(labels=percent, limits=c(0.55,1.0)) +
-  labs(title="Conditional Calibration of 90% Prediction Intervals (All Models)",
-       x="Predicted Median LOS (Days)", y="Empirical Coverage (%)") +
-  theme_bw(base_size=11) +
-  theme(strip.background=element_rect(fill="#f0f0f0"),
-        panel.grid.minor=element_blank(),
-        plot.title=element_text(face="bold"))
+p_cal <- ggplot(cal_df, aes(x = bin_label, y = coverage, group = model)) +
+  geom_hline(yintercept = 0.90, linetype = "dashed", color = "red", alpha = 0.6) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, group = model),
+              fill = "steelblue", alpha = 0.15) +
+  geom_line(color = "steelblue", linewidth = 0.8) +
+  geom_point(color = "steelblue", size = 1.5, alpha = 0.8) +
+  facet_wrap(~model, ncol = 2) +
+  scale_y_continuous(labels = percent, limits = c(0.55, 1.0)) +
+  labs(
+    title    = "Conditional Calibration of 90% Prediction Intervals by Uncertainty Quintile",
+    subtitle = "Q1 = narrowest intervals (low uncertainty)  |  Q5 = widest intervals (high uncertainty)",
+    x        = "Uncertainty Quintile (PI Width)",   # ← 改
+    y        = "Empirical Coverage (%)"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_rect(fill = "#f0f0f0"),
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(face = "bold"),
+    plot.subtitle    = element_text(size = 9, color = "grey40")
+  )
 
 print(p_cal)
-ggsave(file.path(out_dir, "conditional_calibration_all.png"),
-       plot=p_cal, width=12, height=18, dpi=300)
-cat("✓ Saved: conditional_calibration_all.png\n")
+ggsave(file.path(out_dir, "conditional_calibration_uncertainty_quintile.png"),
+       plot = p_cal, width = 12, height = 18, dpi = 300)
+cat("✓ Saved: conditional_calibration_uncertainty_quintile.png\n")
+# ---- 配套表格：各模型在每个Decile的覆盖率 ----
+cal_table <- cal_df %>%
+  mutate(
+    ci_str    = sprintf("%.1f%% [%.1f%%, %.1f%%]",
+                        coverage * 100,
+                        lower    * 100,
+                        upper    * 100)
+  ) %>%
+  select(model, bin_label, ci_str) %>%
+  pivot_wider(names_from = bin_label, values_from = ci_str)
+
+# 打印到console
+cat("\n=== Conditional Calibration by Uncertainty Decile ===\n")
+cat("Format: Coverage% [95% CI lower%, upper%]\n\n")
+print(cal_table, n = Inf, width = Inf)
+
+# 保存为CSV
+write.csv(cal_table,
+          file.path(out_dir, "conditional_calibration_decile_table.csv"),
+          row.names = FALSE)
+cat("✓ Saved: conditional_calibration_decile_table.csv\n")
 
 
-# ---- Coverage vs Width ----
-cover_long <- bind_rows(lapply(names(all_q), function(m) {
-  eval_df %>%
-    transmute(model=m, y,
-              w   = all_q[[m]]$q95 - all_q[[m]]$q05,
-              cov = as.integer(y>=all_q[[m]]$q05 & y<=all_q[[m]]$q95))
-})) %>% filter(is.finite(w), w>=0) %>%
-  mutate(model = factor(model, levels = model_names))
-
-cal_w <- cover_long %>%
-  group_by(model) %>%
-  mutate(w_bin = ntile(w, 10)) %>%
-  group_by(model, w_bin) %>%
-  summarise(n_bin=n(), x=median(w, na.rm=TRUE), coverage=mean(cov, na.rm=TRUE), .groups="drop") %>%
-  mutate(se    = sqrt(coverage*(1-coverage)/n_bin),
-         lower = pmax(0, coverage-1.96*se),
-         upper = pmin(1, coverage+1.96*se))
-
-p_cov_w <- ggplot(cal_w, aes(x=x, y=coverage)) +
-  geom_hline(yintercept=0.90, linetype="dashed", linewidth=0.8, alpha=0.7) +
-  geom_ribbon(aes(ymin=lower,ymax=upper), alpha=0.15) +
-  geom_line(linewidth=0.9) + geom_point(size=2, alpha=0.85) +
-  facet_wrap(~model, ncol=2, scales="free_x") +
-  scale_y_continuous(labels=percent_format(accuracy=1), limits=c(0,1)) +
-  labs(title="Coverage vs Predicted Interval Width (90% PI) — All Models",
-       x="Predicted interval width [bin median]", y="Empirical coverage") +
-  theme_bw(base_size=11) +
-  theme(strip.background=element_rect(fill="#f2f2f2"),
-        panel.grid.minor=element_blank(), plot.title=element_text(face="bold"))
-
-print(p_cov_w)
-ggsave(file.path(out_dir, "coverage_vs_width_all.png"),
-       plot=p_cov_w, width=12, height=18, dpi=300)
-cat("✓ Saved: coverage_vs_width_all.png\n")
 
 
-# ---- 2D calibration heatmap ----
-n_risk_bins <- 8; n_w_bins <- 8; min_n_cell <- 30
 
-long2d <- bind_rows(lapply(names(all_q), function(m) {
-  eval_df %>%
-    transmute(model = m, y,
-              q50  = all_q[[m]]$q50,
-              w    = all_q[[m]]$q95 - all_q[[m]]$q05,
-              cov  = as.integer(y>=all_q[[m]]$q05 & y<=all_q[[m]]$q95))
-})) %>% filter(is.finite(q50), is.finite(w), w>=0) %>%
-  mutate(model = factor(model, levels=model_names))
-
-heat2d <- long2d %>%
-  group_by(model) %>%
-  mutate(risk_bin  = ntile(q50, n_risk_bins),
-         width_bin = ntile(w,   n_w_bins)) %>%
-  group_by(model, risk_bin, width_bin) %>%
-  summarise(n_cell=n(), coverage=mean(cov, na.rm=TRUE), .groups="drop") %>%
-  mutate(delta = coverage - 0.90,
-         delta_plot = ifelse(n_cell < min_n_cell, NA, delta))
-
-p_heat <- ggplot(heat2d, aes(x=risk_bin, y=width_bin, fill=delta_plot)) +
-  geom_tile(color="white", linewidth=0.3) +
-  geom_text(aes(label = ifelse(n_cell >= min_n_cell, n_cell, "")),
-            size = 2.5, color = "black") +
-  facet_wrap(~model, ncol=2) +
-  scale_fill_gradient2(low="#d73027", mid="white", high="#1a9850",
-                       midpoint=0, labels=percent_format(accuracy=1),
-                       na.value="grey90", name="Coverage\n- 90%") +
-  labs(title   = "2D Conditional Calibration (Risk × Uncertainty) — All Models",
-       subtitle = "Grey = too few samples (<30)",
-       x = "Risk bin (predicted median)", y = "Uncertainty bin (interval width)") +
-  theme_bw(base_size=11) +
-  theme(panel.grid=element_blank(), strip.background=element_rect(fill="#f2f2f2"),
-        plot.title=element_text(face="bold"))
-
-print(p_heat)
-ggsave(file.path(out_dir, "calibration_heatmap_all.png"),
-       plot=p_heat, width=12, height=20, dpi=300)
-cat("✓ Saved: calibration_heatmap_all.png\n")
-
-
-# ---- Hypothesis test: does Hybrid beat all categories? ----
-cat("\n========================================\n")
-cat("HYPOTHESIS: Does Hybrid beat all categories?\n")
-cat("========================================\n")
-
-gamma_nn_models  <- c("ENS_Gamma","MCD_Gamma","DDNN_Gamma","BNN_Gamma")
-forest_models    <- c("DRF","QRF","RF","Ensemble_DRF")
-
-best_gamma_crps  <- min(crps_vec[gamma_nn_models], na.rm=TRUE)
-best_forest_crps <- min(crps_vec[forest_models],   na.rm=TRUE)
-hybrid_crps_val  <- crps_vec["Hybrid_NN_DRF"]
-
-cat(sprintf("Best NN/Gamma CRPS:  %.4f  (%s)\n", best_gamma_crps,
-            names(which.min(crps_vec[gamma_nn_models]))))
-cat(sprintf("Best Forest CRPS:    %.4f  (%s)\n", best_forest_crps,
-            names(which.min(crps_vec[forest_models]))))
-cat(sprintf("Hybrid NN+DRF CRPS:  %.4f\n", hybrid_crps_val))
-
-beats_nn     <- hybrid_crps_val < best_gamma_crps
-beats_forest <- hybrid_crps_val < best_forest_crps
-if (beats_nn && beats_forest) {
-  cat("\n✓ ✓ ✓  Hybrid beats BOTH NN/Gamma and forest categories!\n")
-  cat(sprintf("  Δ vs best NN:      %.2f%%\n", 100*(best_gamma_crps-hybrid_crps_val)/best_gamma_crps))
-  cat(sprintf("  Δ vs best forest:  %.2f%%\n", 100*(best_forest_crps-hybrid_crps_val)/best_forest_crps))
-} else if (beats_nn) {
-  cat("\n⚠ Hybrid beats NN/Gamma but not forest\n")
-} else if (beats_forest) {
-  cat("\n⚠ Hybrid beats forest but not NN/Gamma\n")
-} else {
-  cat("\n✗ Hybrid does not beat either category\n")
-}
 
 
 # ============================================================
